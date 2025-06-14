@@ -26,7 +26,7 @@ by [Arun Kumar L](https://github.com/ScriptedByArun47)
 
 ## 🧰 Built With
 
-- **Language:** Python & C++
+- **Language:** Python ,Go & C++
 - **Libraries:** `sublist3r`, `httpx`, `nmap`, `argparse`, `colorama`, `json`
 - **Tools Integrated:** Subfinder, DNSx, Nmap, etc.
 - **Special Modules:**  
