@@ -9,47 +9,5 @@
           "state": "up",
           "reason": "reset"
         },
-        "addresses": [
-          {
-            "addr": "93.127.168.119",
-            "addrtype": "ipv4",
-            "vendor": null
-          }
-        ],
-        "hostnames": [
-          {
-            "name": "cyfotok.com",
-            "type": "user"
-          }
-        ],
-        "ports": {
-          "port": [
-            {
-              "portid": "21",
-              "protocol": "tcp"
-            },
-            {
-              "portid": "80",
-              "protocol": "tcp"
-            },
-            {
-              "portid": "443",
-              "protocol": "tcp"
-            },
-            {
-              "portid": "3306",
-              "protocol": "tcp",
-              "service": {
-                "name": "mysql",
-                "product": "MariaDB",
-                "version": "5.5.5-10.11.10",
-                "method": "probed",
-                "conf": "10"
-              }
-            }
-          ]
-        }
-      }
-    ]
-  }
-}
+        
+           
