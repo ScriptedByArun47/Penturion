@@ -1,4 +1,5 @@
 # SUBSCAN.py - Updated with user-defined INITIAL_NMAP_ARGS for comprehensive initial Nmap scan
+# and crucial directory creation logic.
 
 import sys
 import subprocess
@@ -21,14 +22,26 @@ INITIAL_NMAP_ARGS = "-sS -sV -O -sC -T4 --top-ports 1000 --traceroute --reason -
 def run_nmap_scan(target_ip, output_file="scanout.xml"):
     """
     Runs a basic Nmap scan and outputs results to an XML file.
+    Ensures the output directory exists before running Nmap.
     """
     print(f"[{os.path.basename(__file__)}] Starting Nmap scan for {target_ip}...")
     
+    # --- CRUCIAL ADDITION: Ensure the output directory exists ---
+    output_directory = os.path.dirname(output_file)
+    if output_directory and not os.path.exists(output_directory):
+        try:
+            os.makedirs(output_directory, exist_ok=True) # exist_ok=True prevents error if it already exists
+            print(f"[{os.path.basename(__file__)}] Created output directory: {output_directory}")
+        except OSError as e:
+            print(f"[{os.path.basename(__file__)}] Error creating directory {output_directory}: {e}", file=sys.stderr)
+            return False # Indicate failure if directory cannot be created
+    # -----------------------------------------------------------
+
     # Split the initial Nmap args string into a list, filtering out any empty strings
     args_list = [arg for arg in INITIAL_NMAP_ARGS.split(' ') if arg]
 
     # Construct the final Nmap command list
-    nmap_command = ["nmap"]
+    nmap_command = ["nmap"] # Nmap is expected to be in PATH, otherwise specify full path (e.g., "/usr/bin/nmap")
     nmap_command.extend(args_list) # Add all the flags from the user's string
     
     # Add the XML output flag and file (Nmap expects filename directly after -oX)
@@ -74,7 +87,7 @@ def run_nmap_scan(target_ip, output_file="scanout.xml"):
             return False
 
     except FileNotFoundError:
-        print(f"[{os.path.basename(__file__)}] Error: Nmap not found. Please ensure Nmap is installed and in your system's PATH ({nmap_command[0]}).")
+        print(f"[{os.path.basename(__file__)}] Error: Nmap not found. Please ensure Nmap is installed and in your system's PATH, or provide the full path to the nmap executable instead of just 'nmap'.")
         return False
     except Exception as e:
         print(f"[{os.path.basename(__file__)}] An unexpected error occurred during Nmap execution: {e}")
@@ -87,5 +100,7 @@ if __name__ == "__main__":
         print(f"[{os.path.basename(__file__)}] Error: No target IP received via stdin. Exiting.")
         sys.exit(1)
 
-    if not run_nmap_scan(target_ip, "scanout.xml"):
+    # The hardcoded path for output within SUBSCAN.py
+    # If main.py calls this, ensure main.py passes "/output/scanout.xml"
+    if not run_nmap_scan(target_ip, "output/scanout.xml"):
         sys.exit(1)

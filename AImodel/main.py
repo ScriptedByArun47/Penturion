@@ -1,10 +1,15 @@
-#version 2 - Advanced Scan Combination
+# Version 3.0 - Advanced Scan Combination with Consolidated JSON Output (result.json)
+# This version focuses on robust XML parsing for initial scans, deep merging,
+# and a more comprehensive inference engine.
+
 import json
 import os
 import subprocess
 import time
 import sys
+import xml.etree.ElementTree as ET # Import for XML parsing
 
+# --- FactBase Class ---
 class FactBase:
     """
     Manages the collection of facts derived from scan reports and other inputs.
@@ -38,6 +43,7 @@ class FactBase:
     def __str__(self):
         return json.dumps(self.facts, indent=2)
 
+# --- Rule Class ---
 class Rule:
     """
     Defines a single rule with conditions and actions.
@@ -48,1022 +54,1080 @@ class Rule:
         self.conditions = conditions
         self.actions = actions
         self.priority = priority
-        self.relevant_ports = relevant_ports
-       
+        self.relevant_ports = relevant_ports if relevant_ports is not None else []
+        self.fired = False # Tracks if the rule has fired in the current inference cycle
 
-    def evaluate(self, fact_base: FactBase):
-        """
-        Evaluates if the rule's conditions are met by the current facts.
-        Supports 'and' and 'or' logic within conditions.
-        Returns True if all 'and' groups pass, and at least one 'or' condition passes within its group.
-        """
-        # Group conditions by 'or_group' key
-        grouped_conditions = {}
-        for condition in self.conditions:
-            group = condition.get('or_group', 'default_and_group')
-            if group not in grouped_conditions:
-                grouped_conditions[group] = []
-            grouped_conditions[group].append(condition)
-
-        for group, conditions_in_group in grouped_conditions.items():
-            if group == 'default_and_group': # These are conditions that must ALL be true
-                for condition in conditions_in_group:
-                    if not self._check_condition(fact_base, condition):
-                        return False
-            else: # These are 'or' groups, at least one condition in the group must be true
-                group_passed = False
-                for condition in conditions_in_group:
-                    if self._check_condition(fact_base, condition):
-                        group_passed = True
-                        break
-                if not group_passed:
-                    return False # If no condition in an 'or' group passed, the rule fails
-
-        return True # All conditions (and/or groups) passed
-
-    def _check_condition(self, fact_base: FactBase, condition: dict):
+    def check_condition(self, fact_base, condition):
         """Helper to check a single condition."""
-        fact_key = condition['fact']
-        operator = condition['op']
-        expected_value = condition['value']
-        
-        current_value = fact_base.get_fact(fact_key)
+        op = condition["op"]
+        fact_key = condition["fact"]
+        target_value = condition.get("value")
 
-        if operator == '==':
-            return current_value == expected_value
-        elif operator == '!=':
-            return current_value != expected_value
-        elif operator == 'in': 
-            # For 'in' operator, current_value should be a list, and expected_value an item
-            return isinstance(current_value, list) and expected_value in current_value
-        elif operator == 'contains':
-            # For 'contains', expected_value should be a substring/item in current_value (string or list)
-            if isinstance(current_value, list):
-                return expected_value in current_value
-            elif isinstance(current_value, str):
-                return expected_value in current_value
-            return False
-        elif operator == 'not_contains':
-            # For 'not_contains', expected_value should NOT be a substring/item in current_value
-            if isinstance(current_value, list):
-                return expected_value not in current_value
-            elif isinstance(current_value, str):
-                return expected_value not in current_value
-            return True # If current_value is not list/str, and expected_value is not None, implicitly true (doesn't contain)
-        elif operator == 'exists':
-            return current_value is not None
-        elif operator == 'not_exists':
-            return current_value is None
-        elif operator == 'is_not_empty':
-            return current_value is not None and len(current_value) > 0
-        elif operator == 'contains_any_of':
-            # Checks if the fact_list contains at least one item from the expected_value list
-            if not isinstance(current_value, list) or not isinstance(expected_value, list):
-                return False
-            return any(item in current_value for item in expected_value)
-        elif operator == 'does_not_contain_all':
-            # Checks if the fact_list does NOT contain all items from the expected_value list
-            if not isinstance(current_value, list) or not isinstance(expected_value, list):
-                return False # If not lists, can't check 'contains all'
-            return not all(item in current_value for item in expected_value)
-        else:
-            print(f"Warning: Unknown operator '{operator}' for fact '{fact_key}'. Condition evaluation might fail.")
-            return False
+        if op == "==":
+            return fact_base.get_fact(fact_key) == target_value
+        elif op == "!=":
+            return fact_base.get_fact(fact_key) != target_value
+        elif op == "exists":
+            return fact_base.get_fact(fact_key) is not None
+        elif op == "not_exists":
+            return fact_base.get_fact(fact_key) is None
+        elif op == "contains":
+            return fact_base.fact_list_contains(fact_key, target_value)
+        elif op == "is_not_empty":
+            fact_value = fact_base.get_fact(fact_key)
+            return isinstance(fact_value, (list, dict, str)) and bool(fact_value)
+        elif op == "contains_any_of":
+            fact_list = fact_base.get_fact(fact_key, [])
+            return any(item in fact_list for item in target_value)
+        elif op == "does_not_contain_all":
+            fact_list = fact_base.get_fact(fact_key, [])
+            return not all(item in fact_list for item in target_value)
+        return False
 
-    def execute(self, fact_base: FactBase, decisions: list):
-        """
-        Executes the rule's actions.
-        """
-        for action in self.actions:
-            action_type = action['type']
-            if action_type == 'nmap_command':
-                cmd = action['command']
-                decisions.append({
-                    'type': 'nmap_command',
-                    'command': cmd,
-                    'rule_id': self.rule_id,
-                    'relevant_ports': self.relevant_ports
-                })
-            elif action_type == 'add_fact':
-                fact_base.add_fact(action['key'], action['value'])
-            elif action_type == 'log':
-                decisions.append({
-                    'type': 'log',
-                    'message': action['message']
-                })
-            elif action_type == 'update_scan_stage':
-                fact_base.add_fact('scan_stage', action['value'])
-                decisions.append({
-                    'type': 'log',
-                    'message': f"Scan stage updated to: {action['value']}"
-                })
+    def evaluate(self, fact_base):
+        """Evaluates the rule's conditions against the current FactBase."""
+        # Conditions are implicitly ANDed across different 'or_group's and no_group_conditions.
+        # Conditions within the same 'or_group' are ORed.
+
+        or_groups = {} # Stores conditions grouped by 'or_group' name
+        no_group_conditions = [] # Stores conditions without an 'or_group'
+
+        for condition in self.conditions:
+            or_group_name = condition.get("or_group")
+            if or_group_name:
+                if or_group_name not in or_groups:
+                    or_groups[or_group_name] = []
+                or_groups[or_group_name].append(condition)
             else:
-                print(f"[ERROR] Unknown action type: {action_type}")
+                no_group_conditions.append(condition)
 
+        # Evaluate no-group conditions (all must be true)
+        for condition in no_group_conditions:
+            if not self.check_condition(fact_base, condition):
+                return False
+
+        # Evaluate OR groups (at least one in each group must be true)
+        for group_name, conditions_in_group in or_groups.items():
+            group_met = False
+            for condition in conditions_in_group:
+                if self.check_condition(fact_base, condition):
+                    group_met = True
+                    break
+            if not group_met: # If no condition in an OR group was met, the rule fails
+                return False
+
+        return True
+
+# --- InferenceEngine Class ---
 class InferenceEngine:
     """
-    The brain of the rule-based system.
+    The core inference engine that applies rules to facts to derive new facts
+    or trigger actions. Manages consolidation of Nmap results.
     """
-    def __init__(self, fact_base: FactBase, rules: list, consolidated_output_file: str):
+    def __init__(self, fact_base, rules, consolidated_output_file="consolidated_nmap_results.json"):
+        print("[InferenceEngine] Initializing...") # DEBUG
         self.fact_base = fact_base
-        self.rules = sorted(rules, key=lambda r: r.priority, reverse=True)
-        self.decisions_made = []
-        self.fired_rules = set()
-        self.consolidated_output_file = "consolidated_nmap_results.json"
-        self.consolidated_nmap_data = [] 
-        if os.path.exists(consolidated_output_file) and os.path.getsize(consolidated_output_file) > 0:
+        self.rules = sorted(rules, key=lambda r: r.priority, reverse=True) # Higher priority first
+        self.consolidated_output_file = consolidated_output_file
+        self.consolidated_nmap_data = self._load_consolidated_data()
+        print(f"[InferenceEngine] Loaded {len(self.consolidated_nmap_data)} hosts from consolidated data at init.") # DEBUG
+
+    def _load_consolidated_data(self):
+        """Loads existing consolidated Nmap data from JSON file."""
+        print(f"[InferenceEngine] Attempting to load consolidated data from {self.consolidated_output_file}...") # DEBUG
+        if os.path.exists(self.consolidated_output_file) and os.path.getsize(self.consolidated_output_file) > 0:
             try:
-                with open(consolidated_output_file, 'r') as f:
-                    self.consolidated_nmap_data = json.load(f)
+                with open(self.consolidated_output_file, 'r') as f:
+                    loaded_data = json.load(f)
+                    if 'nmaprun' in loaded_data and 'host' in loaded_data['nmaprun']:
+                        hosts = loaded_data['nmaprun']['host']
+                        # Ensure 'hosts' is always a list, even if only one host
+                        print("[InferenceEngine] Successfully loaded existing consolidated data.") # DEBUG
+                        return [hosts] if isinstance(hosts, dict) else hosts
+                    else:
+                        print(f"[InferenceEngine] Warning: Consolidated file '{self.consolidated_output_file}' has unexpected Nmaprun structure. Starting fresh.")
             except json.JSONDecodeError:
-                print(f"Warning: Existing consolidated file '{consolidated_output_file}' is not valid JSON. Starting fresh.")
-                self.consolidated_nmap_data = []
-    def _deep_merge_nmap_host_data(self, existing_host, new_host):
-        """
-        Recursively merges new_host data into existing_host.
-        Prioritizes new data for single values, merges lists/dictionaries.
-        This is a more generic deep merge for Nmap JSON structure.
-        """
-        for key, new_value in new_host.items():
-            if key not in existing_host:
-                existing_host[key] = new_value
-            else:
-                existing_value = existing_host[key]
-                if isinstance(new_value, dict) and isinstance(existing_value, dict):
-                    self._deep_merge_nmap_host_data(existing_value, new_value)
-                elif isinstance(new_value, list) and isinstance(existing_value, list):
-                    # Special handling for Nmap lists that should be unique or merged by ID
-                    if key in ['protocols', 'hostscript']:
-                        # For 'protocols', each item in the list is a dict for a port/proto
-                        # For 'hostscript', each item is a dict for a script result
-                        # We need to merge by a unique identifier (port for protocols, id for hostscript)
-                        existing_ids = {item.get('port') if key == 'protocols' else item.get('id'): item for item in existing_value}
-                        for new_item in new_value:
-                            item_id = new_item.get('port') if key == 'protocols' else new_item.get('id')
-                            if item_id and item_id in existing_ids:
-                                self._deep_merge_nmap_host_data(existing_ids[item_id], new_item)
-                            else:
-                                existing_value.append(new_item)
-                    else:
-                        # For other lists (like 'addresses', 'status'), simply extend and unique if necessary
-                        # Nmap's JSON structure often has simple lists that can just be extended.
-                        existing_host[key] = list(set(existing_value + new_value)) # Basic unique merge for simple lists
-                else:
-                    # For non-list/dict types, new value overwrites existing
-                    existing_host[key] = new_value
-    def run(self):
-        """
-        Runs the inference process.
-        """
-        print("--- Starting Nmap Decision Inference ---")
-        
-        max_passes = 10 # Increased max passes to allow more rule firing
-        for i in range(max_passes):
-            rules_fired_in_pass = 0
-            print(f"\n--- Inference Pass {i+1} (Current Stage: {self.fact_base.get_fact('scan_stage', 'unknown')})---")
-            
-            current_decisions_for_pass = []
-            
-            # Create a copy of rules to iterate over, in case new rules are added or priorities change dynamically (not in this version)
-            # Or, just iterate over self.rules directly if rules are static after initialization
-            for rule in self.rules:
-                # Check if the rule has already been fired and if it's not a rule designed to fire multiple times (e.g., initial scans)
-                # For simplicity, all rules currently fire once. If a rule should re-evaluate, remove from self.fired_rules
-                if rule.rule_id not in self.fired_rules and rule.evaluate(self.fact_base):
-                    print(f"Rule Fired: {rule.rule_id} - {rule.description}")
-                    rule.execute(self.fact_base, current_decisions_for_pass)
-                    self.fired_rules.add(rule.rule_id)
-                    rules_fired_in_pass += 1
-            
-            if not current_decisions_for_pass:
-                print(f"No new rules fired in pass {i+1}. Stopping inference.")
-                break
+                print(f"[InferenceEngine] Warning: Consolidated file '{self.consolidated_output_file}' is not valid JSON. Starting fresh.")
+            except Exception as e:
+                print(f"[InferenceEngine] Error loading existing consolidated file '{self.consolidated_output_file}': {e}. Starting fresh.")
+        print("[InferenceEngine] No valid consolidated data found or loaded.") # DEBUG
+        return []
 
-            for decision in current_decisions_for_pass:
-                self.decisions_made.append(decision) 
+    def _save_consolidated_data(self):
+        """Saves consolidated Nmap data to JSON file, ensuring it's wrapped in an nmaprun structure."""
+        if not self.consolidated_nmap_data:
+            print(f"No Nmap scan results to consolidate and save to {self.consolidated_output_file}.")
+            return
+
+        # Ensure consolidated_nmap_data is a list of host dictionaries
+        hosts_to_save = self.consolidated_nmap_data if isinstance(self.consolidated_nmap_data, list) else [self.consolidated_nmap_data]
+
+        nmap_run_structure = {
+            "nmaprun": {
+                "@scanner": "nmap",
+                "@args": "Consolidated by Custom AI Model",
+                "@start": int(time.time()),
+                "host": hosts_to_save
+            }
+        }
+        try:
+            with open(self.consolidated_output_file, 'w') as f:
+                json.dump(nmap_run_structure, f, indent=2)
+            print(f"Consolidated Nmap data saved to {self.consolidated_output_file}")
+        except Exception as e:
+            print(f"Error saving consolidated data to {self.consolidated_output_file}: {e}")
+
+    def _deep_merge_nmap_host_data(self, existing_data, new_data):
+        """
+        Deep merges new Nmap scan data (a single host entry) into existing consolidated data.
+        Assumes both are Nmap JSON host data structures.
+        This handles lists of dictionaries (e.g., ports, hostscript, addresses) by merging
+        entries based on unique identifiers (portid/protocol, script id, address).
+        """
+        if not existing_data:
+            return new_data
+
+        merged_data = existing_data.copy()
+
+        for key, new_value in new_data.items():
+            if key in merged_data:
+                existing_value = merged_data[key]
                 
-                if decision['type'] == 'nmap_command':
-                    command_template = decision['command']
-                    final_nmap_command = command_template
+                # Special handling for 'ports' list
+                if key == 'ports' and isinstance(existing_value, dict) and isinstance(new_value, dict):
+                    existing_port_list = existing_value.get('port', [])
+                    new_port_list = new_value.get('port', [])
 
-                    # Dynamic fact replacement in Nmap command
-                    # This block can be extended for other dynamic facts, e.g., {fact:target_os}
-                    if "{fact:open_tcp_ports}" in final_nmap_command:
-                        open_ports = self.fact_base.get_fact('open_tcp_ports', [])
-                        if open_ports:
-                            formatted_ports = ",".join(map(str, open_ports))
-                            final_nmap_command = final_nmap_command.replace("{fact:open_tcp_ports}", formatted_ports)
+                    # Ensure lists are actual lists, even if Nmap JSON output has single dict
+                    if not isinstance(existing_port_list, list):
+                        existing_port_list = [existing_port_list]
+                    if not isinstance(new_port_list, list):
+                        new_port_list = [new_port_list]
+
+                    # Create a map for quick lookup by (portid, protocol)
+                    existing_ports_map = {(p.get('portid'), p.get('protocol')): p for p in existing_port_list}
+
+                    for new_port in new_port_list:
+                        port_id = new_port.get('portid')
+                        protocol = new_port.get('protocol')
+                        if (port_id, protocol) in existing_ports_map:
+                            # Update existing port entry
+                            existing_ports_map[(port_id, protocol)].update(new_port)
                         else:
-                            print(f"[WARNING] Rule {decision['rule_id']}: Nmap command requires open_tcp_ports, but none found. Skipping command.")
-                            continue # Skip this Nmap command if ports are missing
+                            # Add new port entry
+                            existing_ports_map[(port_id, protocol)] = new_port
+                    
+                    merged_data[key]['port'] = list(existing_ports_map.values())
 
-                    if "{fact:open_http_ports}" in final_nmap_command:
-                        open_http_ports = self.fact_base.get_fact('open_http_ports', [])
-                        if open_http_ports:
-                            formatted_ports = ",".join(map(str, open_http_ports))
-                            final_nmap_command = final_nmap_command.replace("{fact:open_http_ports}", formatted_ports)
+                # Special handling for 'hostscript' list
+                elif key == 'hostscript' and isinstance(existing_value, list) and isinstance(new_value, list):
+                    existing_script_map = {s.get('id'): s for s in existing_value}
+                    for new_script in new_value:
+                        script_id = new_script.get('id')
+                        if script_id in existing_script_map:
+                            existing_script_map[script_id].update(new_script)
                         else:
-                            print(f"[WARNING] Rule {decision['rule_id']}: Nmap command requires open_http_ports, but none found. Skipping command.")
-                            continue # Skip this Nmap command if ports are missing
-                    
-                    if "{fact:open_udp_ports}" in final_nmap_command:
-                        open_udp_ports = self.fact_base.get_fact('open_udp_ports', [])
-                        if open_udp_ports:
-                            formatted_ports = ",".join(map(str, open_udp_ports))
-                            final_nmap_command = final_nmap_command.replace("{fact:open_udp_ports}", formatted_ports)
-                        else:
-                            print(f"[WARNING] Rule {decision['rule_id']}: Nmap command requires open_udp_ports, but none found. Skipping command.")
-                            continue # Skip this Nmap command if ports are missing
+                            existing_script_map[script_id] = new_script
+                    merged_data[key] = list(existing_script_map.values())
+                
+                # Special handling for 'addresses' list
+                elif key == 'addresses' and isinstance(existing_value, list) and isinstance(new_value, list):
+                    existing_addr_map = {a.get('addr'): a for a in existing_value}
+                    for new_addr in new_value:
+                        addr = new_addr.get('addr')
+                        if addr not in existing_addr_map: # Only add if address doesn't exist
+                            existing_addr_map[addr] = new_addr
+                    merged_data[key] = list(existing_addr_map.values())
 
-                    print(f"\n[Executing Command from {decision['rule_id']}]: {final_nmap_command}")
-                    
-                    temp_output_file = f"temp_nmap_output_{decision['rule_id']}_{int(time.time())}.json"
-                    command_with_output = f"{final_nmap_command} -oJ {temp_output_file}"
-                    
-                    if self.fact_base.get_fact('target_ip') and self.fact_base.get_fact('target_ip') not in command_with_output:
-                        command_with_output += f" {self.fact_base.get_fact('target_ip')}"
+                # Generic list merging (append unique items)
+                elif isinstance(existing_value, list) and isinstance(new_value, list):
+                    for item in new_value:
+                        if item not in existing_value:
+                            existing_value.append(item)
+                # Recursive merge for nested dictionaries
+                elif isinstance(existing_value, dict) and isinstance(new_value, dict):
+                    merged_data[key] = self._deep_merge_nmap_host_data(existing_value, new_value)
+                # Overwrite for other types (strings, numbers, booleans)
+                else:
+                    merged_data[key] = new_value
+            else:
+                # Add new key-value pairs
+                merged_data[key] = new_value
+        return merged_data
 
-                    print(f"Running: {command_with_output}")
-                    
-                    process = subprocess.run(
-                        command_with_output, 
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        check=False
-                    )
-                    print(f"Nmap Command Output (stdout):\n{process.stdout}")
-                    if process.stderr:
-                        print(f"Nmap Command Errors (stderr):\n{process.stderr}")
-                    
-                    if process.returncode == 0:
-                        print(f"Nmap command finished successfully. Output saved to {temp_output_file}")
-                        try:
-                            time.sleep(0.5) 
+    def consolidate_and_add_scan_data(self, new_scan_nmap_run_data):
+        print("[InferenceEngine] Consolidating new scan data...") # Add debug print
+        # Merge new scan data into existing consolidated data
+        if not self.consolidated_nmap_data:
+            # If consolidated data is empty, initialize it with the new scan data
+            # Ensure new_scan_nmap_run_data['nmaprun']['host'] is a list
+            self.consolidated_nmap_data = new_scan_nmap_run_data['nmaprun']['host'] if isinstance(new_scan_nmap_run_data['nmaprun']['host'], list) else [new_scan_nmap_run_data['nmaprun']['host']]
+            print(f"[InferenceEngine] Adding new host {self.consolidated_nmap_data[0].get('address', {}).get('addr')} to consolidated data.") # Debug print for new host
+        else:
+            # Deep merge existing and new host data
+            for new_host_data in (new_scan_nmap_run_data['nmaprun']['host'] if isinstance(new_scan_nmap_run_data['nmaprun']['host'], list) else [new_scan_nmap_run_data['nmaprun']['host']]):
+                new_host_ip = new_host_data.get('address', {}).get('addr')
+                if new_host_ip:
+                    found_existing = False
+                    for i, existing_host_data in enumerate(self.consolidated_nmap_data):
+                        if existing_host_data.get('address', {}).get('addr') == new_host_ip:
+                            self.consolidated_nmap_data[i] = self._deep_merge_nmap_host_data(existing_host_data, new_host_data)
+                            print(f"[InferenceEngine] Merging new scan data for {new_host_ip} into consolidated data.") # Debug print for merge
+                            found_existing = True
+                            break
+                    if not found_existing:
+                        self.consolidated_nmap_data.append(new_host_data)
+                        print(f"[InferenceEngine] Adding new host {new_host_ip} to consolidated data.") # Debug print for new host
 
-                            if not os.path.exists(temp_output_file) or os.path.getsize(temp_output_file) == 0:
-                                print(f"Warning: Temporary Nmap JSON file '{temp_output_file}' not found or empty. Cannot parse.")
-                                continue 
+        # --- NEW CODE HERE ---
+        # Preserve existing facts that are not derived from Nmap XML/JSON directly, like 'scan_stage'
+        facts_to_preserve = {}
+        if self.fact_base.get_fact('scan_stage'):
+            facts_to_preserve['scan_stage'] = self.fact_base.get_fact('scan_stage')
+        # Add other such facts here if they are introduced later (e.g., 'vulnerability_found', 'exploit_attempted')
+        # --- END NEW CODE ---
 
-                            with open(temp_output_file, 'r') as f:
-                                new_nmap_data = json.load(f)
-                            print(f"Parsing new scan data from {temp_output_file}...")
+        # After consolidation, re-parse facts from the updated consolidated data
+        print("[InferenceEngine] Re-parsing facts from updated consolidated data for inference.") # DEBUG
+        # Pass a pseudo nmaprun structure to parse_nmap_json_report
+        self.fact_base = parse_nmap_json_report({"nmaprun": {"host": self.consolidated_nmap_data}})
+        
+        # --- NEW CODE HERE ---
+        # Re-add preserved facts
+        for key, value in facts_to_preserve.items():
+            self.fact_base.add_fact(key, value)
+        # --- END NEW CODE ---
 
-                            # Merge new Nmap data into the consolidated list
-                            # For Nmap, usually each new scan adds more detail or re-scans.
-                            # A simple append of host entries is okay for now, but a more robust merge
-                            # would update existing host entries with new port/script details.
-                            if isinstance(new_nmap_data, list):
-                                for host_entry in new_nmap_data:
-                                    found_existing_host = False
-                                    for existing_host in self.consolidated_nmap_data:
-                                        if existing_host.get('host') == host_entry.get('host'):
-                                            # Found existing host, merge relevant parts (ports, scripts, OS)
-                                            # This is a simplified merge. A real-world scenario might need deep merging.
+        self._save_consolidated_data()
 
-                                            # Merge protocols/ports
-                                            for proto, ports in host_entry.get('protocols', {}).items():
-                                                if proto not in existing_host.get('protocols', {}):
-                                                    existing_host.setdefault('protocols', {})[proto] = []
+    def run(self):
+        """Runs the inference process."""
+        print("\n--- Starting Nmap Decision Inference ---") # This should be seen
+        num_passes = 0
+        MAX_PASSES = 10 # Safety break to prevent infinite loops
 
-                                                for new_port_entry in ports:
-                                                    port_exists = False
-                                                    for existing_port_entry in existing_host['protocols'][proto]:
-                                                        if existing_port_entry.get('port') == new_port_entry.get('port'):
-                                                            # Update existing port details
-                                                            existing_port_entry.update(new_port_entry) # <--- Key update here
-                                                            port_exists = True
-                                                            break
-                                                    if not port_exists:
-                                                        existing_host['protocols'][proto].append(new_port_entry)
+        while True:
+            num_passes += 1
+            print(f"\n--- Inference Pass {num_passes} (Current Stage: {self.fact_base.get_fact('scan_stage', 'unknown')})---")
+            fired_a_rule_in_pass = False
 
-                                            # Merge hostscript results
-                                            if 'hostscript' in host_entry:
-                                                if 'hostscript' not in existing_host:
-                                                    existing_host['hostscript'] = []
-                                                for new_script_result in host_entry['hostscript']:
-                                                    script_exists = False
-                                                    for existing_script_result in existing_host['hostscript']:
-                                                        if existing_script_result.get('id') == new_script_result.get('id'):
-                                                            existing_script_result.update(new_script_result) # <--- Key update here
-                                                            script_exists = True
-                                                            break
-                                                    if not script_exists:
-                                                        existing_host['hostscript'].append(new_script_result)
+            # Sort rules by priority (highest first) for each pass
+            # This ensures high-priority rules (e.g., initial scans) run before lower ones
+            for rule in self.rules:
+                # Only evaluate rules that haven't fired yet OR are designed to fire multiple times if conditions reset
+                # For simplicity, current rules only fire once per run() call (rule.fired flag)
+                if not rule.fired and rule.evaluate(self.fact_base):
+                    print(f"Rule Fired: {rule.rule_id} - {rule.description}")
+                    rule.fired = True # Mark rule as fired for this run
+                    fired_a_rule_in_pass = True
 
-                                            # Merge OS detection
-                                            if 'os' in host_entry and not existing_host.get('os'):
-                                                existing_host['os'] = host_entry['os']
+                    for action in rule.actions:
+                        if action["type"] == "log":
+                            log_message = action["message"].format(
+                                **{f"fact:{k}": v for k, v in self.fact_base.facts.items()}
+                            )
+                            print(f"  Action: {log_message}")
+                        elif action["type"] == "add_fact":
+                            self.fact_base.add_fact(action["key"], action["value"])
+                            print(f"  Action: Added fact '{action['key']}': {action['value']}")
+                        elif action["type"] == "update_scan_stage":
+                            self.fact_base.add_fact("scan_stage", action["value"])
+                            print(f"  Action: Updated scan stage to '{action['value']}'")
+                        elif action["type"] == "nmap_command":
+                            command_template = action["command"]
+                            
+                            # Format command using facts from FactBase
+                            # Special handling for list facts like 'open_tcp_ports' to join them with commas
+                            formatted_command = command_template.format(
+                                **{f"fact:{k}": ','.join(map(str, v)) if isinstance(v, list) else str(v) 
+                                   for k, v in self.fact_base.facts.items()}
+                            )
+                            
+                            print(f"  Action: Executing Nmap command for rule: {formatted_command}") # DEBUG
+                            
+                            temp_scan_file = "temp_scan_output.xml" # All rule-triggered scans output to XML
+                            
+                            current_target_ip = self.fact_base.get_fact('target_ip')
+                            if current_target_ip:
+                                # Construct the full Nmap command list
+                                nmap_full_command_list = [NMAP_EXECUTABLE_PATH]
+                                # Add arguments from the formatted command template
+                                # This simple split assumes no complex quoted arguments. For production, shlex.split is better.
+                                for arg_part in formatted_command.split():
+                                    if arg_part.strip():
+                                        nmap_full_command_list.append(arg_part)
+                                
+                                # Ensure -oX and output file are correctly placed
+                                # We explicitly control output to XML for easier parsing
+                                if "-oX" not in nmap_full_command_list:
+                                    nmap_full_command_list.extend(["-oX", os.path.abspath(temp_scan_file)])
+                                else: # If -oX was in template, ensure its value is our temp file
+                                    idx = nmap_full_command_list.index("-oX")
+                                    nmap_full_command_list[idx+1] = os.path.abspath(temp_scan_file)
+                                
+                                # Always append target IP last, as Nmap expects it
+                                if current_target_ip not in nmap_full_command_list:
+                                    nmap_full_command_list.append(current_target_ip)
 
-                                            found_existing_host = True
-                                            break
+                                print(f"  DEBUG: Actual Nmap command for rule: {' '.join(nmap_full_command_list)}")
 
-                                    if not found_existing_host:
-                                        self.consolidated_nmap_data.append(host_entry)
-                        except Exception as parse_e:
-                            print(f"Error parsing temporary Nmap JSON output {temp_output_file}: {parse_e}")
-                        finally:
-                            if os.path.exists(temp_output_file):
-                                os.remove(temp_output_file)
-                                print(f"Cleaned up temporary file: {temp_output_file}")
-                    else:
-                        print(f"Nmap command exited with code {process.returncode}. Check output above for details.")
+                                try:
+                                    rule_scan_process = subprocess.run(
+                                        nmap_full_command_list,
+                                        capture_output=True,
+                                        text=True,
+                                        check=False # Do not raise exception for non-zero exit codes
+                                    )
+                                    print(f"  Nmap Rule Scan stdout:\n{rule_scan_process.stdout}")
+                                    if rule_scan_process.stderr:
+                                        print(f"  Nmap Rule Scan stderr:\n{rule_scan_process.stderr}")
+
+                                    time.sleep(0.5) # Give file system a moment
+
+                                    if os.path.exists(temp_scan_file) and os.path.getsize(temp_scan_file) > 0:
+                                        print(f"  Nmap rule scan completed. Output saved to {temp_scan_file}")
+                                        
+                                        # Parse the new scan data (which is XML) and convert to JSON for consolidation
+                                        new_scan_data_json_format = {}
+                                        try:
+                                            xml_tree = ET.parse(temp_scan_file)
+                                            root = xml_tree.getroot()
+                                            # Convert relevant host data from XML to our internal JSON structure
+                                            converted_host_data = []
+                                            for host_elem in root.findall('host'):
+                                                host_json = _convert_xml_host_to_json_dict(host_elem)
+                                                if host_json:
+                                                    converted_host_data.append(host_json)
+                                            
+                                            if converted_host_data:
+                                                # Wrap in 'nmaprun' structure for consolidate_and_add_scan_data
+                                                new_scan_data_json_format = {"nmaprun": {"host": converted_host_data}}
+                                                self.consolidate_and_add_scan_data(new_scan_data_json_format)
+                                            else:
+                                                print("  Warning: No host data found in rule-triggered XML scan to convert for consolidation.")
+                                            
+                                        except ET.ParseError as e:
+                                            print(f"  Warning: Temp scan file '{temp_scan_file}' is not valid XML. Skipping consolidation: {e}")
+                                        except Exception as ex:
+                                            print(f"  Error processing XML '{temp_scan_file}': {ex}")
+
+                                        # Clean up temporary scan file
+                                        if os.path.exists(temp_scan_file):
+                                            os.remove(temp_scan_file)
+                                            print(f"  Cleaned up temporary rule scan file: {temp_scan_file}")
+
+                                    else:
+                                        print(f"  Warning: Nmap rule scan output file '{temp_scan_file}' was not created or is empty.")
+
+                                except FileNotFoundError:
+                                    print(f"  Error: Nmap not found at '{NMAP_EXECUTABLE_PATH}'. Please ensure Nmap is installed and the path is correct.")
+                                except Exception as e:
+                                    print(f"  An unexpected error occurred during Nmap rule execution: {e}")
+                            else:
+                                print("  Warning: Target IP not found for rule-triggered Nmap command.")
+
+            if not fired_a_rule_in_pass:
+                print("No new rules fired in this pass. Stopping inference.")
+                break # No rules fired, stop the loop
+            
+            if num_passes > MAX_PASSES:
+                print(f"Max inference passes reached ({MAX_PASSES}). Stopping to prevent infinite loop.")
+                break # Safety break
 
         print("\n--- Inference Complete ---")
-        if not self.decisions_made:
+        if self.fact_base.get_fact('final_report_ready'):
+            print("Scan process indicates final report is ready.")
+        else:
             print("No specific Nmap commands or actions recommended based on current rules and facts.")
-        else:
-            print("\nSummary of Recommended/Executed Actions:")
-            for decision in self.decisions_made:
-                if decision['type'] == 'nmap_command':
-                    ports_info = ""
-                    if decision['relevant_ports'] is None or decision['relevant_ports'] == "Host":
-                        ports_info = "Host"
-                    elif isinstance(decision['relevant_ports'], list):
-                        if len(decision['relevant_ports']) == 1:
-                            ports_info = str(decision['relevant_ports'][0])
-                        else:
-                            ports_info = f"Ports {','.join(map(str, decision['relevant_ports']))}"
-                    elif isinstance(decision['relevant_ports'], str):
-                        ports_info = decision['relevant_ports']
-
-                    print(f"Port: {ports_info:<15} Command: {decision['command']:<60} Reason: {decision['rule_id']}")
-                elif decision['type'] == 'log':
-                    print(f"Log: {decision['message']}")
         
-        if self.consolidated_nmap_data:
-            try:
-                with open(self.consolidated_output_file, 'w') as f:
-                    json.dump(self.consolidated_nmap_data, f, indent=2)
-                print(f"\nAll Nmap scan results consolidated and saved to: {self.consolidated_output_file}")
-            except Exception as e:
-                print(f"Error writing consolidated Nmap data to file {self.consolidated_output_file}: {e}")
-        else:
-            print(f"\nNo Nmap scan results to consolidate and save to {self.consolidated_output_file}.")
+        self._save_consolidated_data() # Save final consolidated data
 
-
-def parse_nmap_json_report(json_report_data):
+# --- XML to JSON Conversion Helper (for Nmap XML output) ---
+def _convert_xml_host_to_json_dict(host_elem):
     """
-    Parses a simplified Nmap JSON report into a FactBase.
-    This function can be called multiple times to update facts.
-    It now also parses UDP ports if available.
+    Converts an Nmap XML <host> element into a simplified JSON dictionary structure
+    consistent with what parse_nmap_json_report expects.
+    This is necessary because Nmap's -oJ (JSON) output has inconsistencies
+    (e.g., single item lists vs. actual lists) that XML parsing avoids.
+    """
+    host_json = {}
+
+    # Status
+    status_elem = host_elem.find('status')
+    if status_elem is not None:
+        host_json['status'] = {"state": status_elem.get('state'), "reason": status_elem.get('reason')}
+
+    # Addresses
+    host_json['addresses'] = []
+    for addr_elem in host_elem.findall('address'):
+        host_json['addresses'].append({
+            "addr": addr_elem.get('addr'),
+            "addrtype": addr_elem.get('addrtype'),
+            "vendor": addr_elem.get('vendor')
+        })
+    
+    # Hostnames
+    hostnames_elem = host_elem.find('hostnames')
+    if hostnames_elem:
+        host_json['hostnames'] = []
+        for hostname_elem in hostnames_elem.findall('hostname'):
+            host_json['hostnames'].append({
+                "name": hostname_elem.get('name'),
+                "type": hostname_elem.get('type')
+            })
+
+    # Ports
+    ports_elem = host_elem.find('ports')
+    if ports_elem:
+        host_json['ports'] = {'port': []} # Ensure 'port' is always a list for consistency
+        for port_elem in ports_elem.findall('port'):
+            port_info = {
+                "portid": port_elem.get('portid'),
+                "protocol": port_elem.get('protocol')
+            }
+            state_elem = port_elem.find('state')
+            if state_elem:
+                port_info['state'] = {"state": state_elem.get('state'), "reason": state_elem.get('reason')}
+            service_elem = port_elem.find('service')
+            if service_elem:
+                service_dict = {
+                    "name": service_elem.get('name'),
+                    "product": service_elem.get('product'),
+                    "version": service_elem.get('version'),
+                    "extrainfo": service_elem.get('extrainfo'),
+                    "method": service_elem.get('method'),
+                    "conf": service_elem.get('conf') # Add confidence if available
+                }
+                port_info['service'] = {k: v for k, v in service_dict.items() if v is not None}
+            host_json['ports']['port'].append(port_info)
+    
+    # OS Detection
+    os_elem = host_elem.find('os')
+    if os_elem:
+        os_matches = os_elem.findall('osmatch')
+        if os_matches:
+            host_json['os'] = {'osmatch': []}
+            for os_match_elem in os_matches:
+                os_match_dict = {
+                    "name": os_match_elem.get('name'),
+                    "accuracy": os_match_elem.get('accuracy'),
+                    "osclass": []
+                }
+                for os_class_elem in os_match_elem.findall('osclass'):
+                    os_class_dict = {
+                        "type": os_class_elem.get('type'),
+                        "vendor": os_class_elem.get('vendor'),
+                        "osfamily": os_class_elem.get('osfamily'),
+                        "osgen": os_class_elem.get('osgen'),
+                        "accuracy": os_class_elem.get('accuracy')
+                    }
+                    cpe_elem = os_class_elem.find('cpe')
+                    if cpe_elem is not None:
+                        os_class_dict['cpe'] = cpe_elem.text
+                    os_match_dict['osclass'].append(os_class_dict)
+                host_json['os']['osmatch'].append(os_match_dict)
+    
+    # Hostscript results
+    hostscript_elem = host_elem.find('hostscript')
+    if hostscript_elem:
+        host_json['hostscript'] = []
+        for script_elem in hostscript_elem.findall('script'):
+            host_json['hostscript'].append({
+                "id": script_elem.get('id'),
+                "output": script_elem.get('output')
+            })
+            
+    return host_json
+
+# --- Fact Parsing from XML ---
+def parse_nmap_xml_report(xml_raw_data, target_ip_hint=None):
+    """
+    Parses Nmap XML report data into a FactBase.
+    Can be given a target_ip_hint to prioritize finding facts for a specific IP.
     """
     facts = FactBase()
+    if not xml_raw_data:
+        print("Warning: No XML data provided to parse_nmap_xml_report.")
+        return facts
+    try:
+        root = ET.fromstring(xml_raw_data)
+    except ET.ParseError:
+        print("Warning: Invalid XML data provided to parse_nmap_xml_report. Could not parse.")
+        return facts
+
+    target_host_elem = None
+    if target_ip_hint: # Try to find the specific host if a hint is provided
+        for host_elem in root.findall('host'):
+            for address_elem in host_elem.findall('address'):
+                if address_elem.get('addrtype') == 'ipv4' and address_elem.get('addr') == target_ip_hint:
+                    target_host_elem = host_elem
+                    break
+            if target_host_elem is not None:
+                break
     
-    if not isinstance(json_report_data, list) or not json_report_data:
-        return facts
+    # If no specific target_ip_hint host found, or no hint, just take the first host
+    if target_host_elem is None:
+        target_host_elem = root.find('host')
 
-    if len(json_report_data) == 0:
-        return facts
-
-    host_data = json_report_data[0] # Assuming one host per single Nmap JSON output for simplicity
-
-    host_ip = host_data.get('host')
-    hostname = host_data.get('hostname')
-    host_state = host_data.get('state')
-
-    if host_ip:
-        facts.add_fact('target_ip', host_ip)
-    if hostname:
-        facts.add_fact('target_hostname', hostname)
-    if host_state:
-        facts.add_fact('host_status', host_state)
-
-    open_tcp_ports_list = []
-    open_udp_ports_list = []
-    open_http_ports_list = [] # To specifically track HTTP/HTTPS ports
-
-    if 'protocols' in host_data:
-        # Parse TCP ports
-        if 'tcp' in host_data['protocols']:
-            for port_entry in host_data['protocols']['tcp']:
-                port = port_entry.get('port')
-                state = port_entry.get('state')
-                service = port_entry.get('service')
-                version = port_entry.get('version')
-
-                if state == 'open':
-                    open_tcp_ports_list.append(port)
-                    facts.add_fact(f'port_{port}_state', 'open')
-                    if service:
-                        facts.add_fact(f'port_{port}_service', service)
-                        # Identify HTTP/HTTPS services
-                        if service in ['http', 'https', 'http-proxy', 'ssl/http', 'http-alt']:
-                            open_http_ports_list.append(port)
-                    if version:
-                        facts.add_fact(f'port_{port}_version', version)
-                elif state in ['closed', 'filtered']:
-                    facts.add_fact(f'port_{port}_state', state)
+    if target_host_elem is not None:
+        # IP Address
+        for address_elem in target_host_elem.findall('address'):
+            if address_elem.get('addrtype') == 'ipv4':
+                facts.add_fact('target_ip', address_elem.get('addr'))
+                break
         
-        # Parse UDP ports
-        if 'udp' in host_data['protocols']:
-            for port_entry in host_data['protocols']['udp']:
-                port = port_entry.get('port')
-                state = port_entry.get('state')
-                service = port_entry.get('service')
-                version = port_entry.get('version')
+        # Host State (up/down)
+        status_elem = target_host_elem.find('status')
+        if status_elem is not None:
+            facts.add_fact('host_state', status_elem.get('state'))
 
-                if state == 'open':
-                    open_udp_ports_list.append(port)
-                    facts.add_fact(f'udp_port_{port}_state', 'open') # Differentiate UDP facts
-                    if service:
-                        facts.add_fact(f'udp_port_{port}_service', service)
-                    if version:
-                        facts.add_fact(f'udp_port_{port}_version', version)
-                elif state in ['closed', 'filtered']:
-                    facts.add_fact(f'udp_port_{port}_state', state)
+        # Ports and Services
+        open_tcp_ports = []
+        open_udp_ports = []
+        open_http_ports = []
+        open_https_ports = []
+        known_services = []
+
+        ports_elem = target_host_elem.find('ports')
+        if ports_elem is not None:
+            for port_elem in ports_elem.findall('port'):
+                state_elem = port_elem.find('state')
+                if state_elem is not None and state_elem.get('state') == 'open':
+                    port_id = int(port_elem.get('portid'))
+                    protocol = port_elem.get('protocol')
+                    service_elem = port_elem.find('service')
+                    service_name = service_elem.get('name') if service_elem is not None else None
+                    service_product = service_elem.get('product') if service_elem is not None else None
+                    service_version = service_elem.get('version') if service_elem is not None else None
+                    
+                    if protocol == 'tcp':
+                        open_tcp_ports.append(port_id)
+                        # Heuristic for HTTP/HTTPS ports based on service name or common ports
+                        if service_name and ('http' in service_name or 'ssl/http' in service_name):
+                            open_http_ports.append(port_id)
+                        if 'ssl/https' in service_name or port_id == 443: # Explicitly add 443 to https
+                             open_https_ports.append(port_id)
+                        # Add other common services for rule triggering
+                        if service_name in ["ftp", "ssh", "mysql", "microsoft-ds", "msrpc", "rdp"]:
+                            facts.add_fact(f"service_open_{service_name}", True)
+
+                    elif protocol == 'udp':
+                        open_udp_ports.append(port_id)
+                    
+                    if service_name:
+                        known_services.append(service_name)
+                    if service_product:
+                        facts.add_fact(f"service_product_{port_id}", service_product)
+                    if service_version:
+                        facts.add_fact(f"service_version_{port_id}", service_version)
+        
+        facts.add_fact('open_tcp_ports', sorted(list(set(open_tcp_ports))))
+        facts.add_fact('open_udp_ports', sorted(list(set(open_udp_ports))))
+        facts.add_fact('open_http_ports', sorted(list(set(open_http_ports))))
+        facts.add_fact('open_https_ports', sorted(list(set(open_https_ports))))
+        facts.add_fact('known_services', sorted(list(set(known_services))))
+
+        # OS Detection
+        os_elem = target_host_elem.find('os')
+        if os_elem is not None and os_elem.find('osmatch') is not None:
+            os_matches = os_elem.findall('osmatch')
+            if os_matches:
+                best_os_match = os_matches[0] # Take the highest accuracy match
+                facts.add_fact('os_name', best_os_match.get('name'))
+                facts.add_fact('os_accuracy', int(best_os_match.get('accuracy'))) # Convert to int
                 
-    facts.add_fact('open_tcp_ports', sorted(list(set(open_tcp_ports_list))))
-    facts.add_fact('open_udp_ports', sorted(list(set(open_udp_ports_list))))
-    facts.add_fact('open_http_ports', sorted(list(set(open_http_ports_list)))) # Add the HTTP specific fact
-
-    if 'os' in host_data and len(host_data['os']) > 0:
-        facts.add_fact('target_os', host_data['os'][0]['name'])
-    if 'hostscript' in host_data and len(host_data['hostscript']) > 0:
-        facts.add_fact('initial_scripts_run', True)
-        for script_result in host_data['hostscript']:
-            script_id = script_result.get('id')
-            script_output = script_result.get('output')
-            if script_id and script_output:
-                facts.add_fact(f'script_output_{script_id}', script_output)
-                # Specific facts based on script output (for R505)
-                if script_id == 'smb-vuln-ms17-010' and 'VULNERABLE' in script_output:
-                    facts.add_fact('smb_vuln_ms17_010_detected', True)
-                if script_id == 'ssl-heartbleed' and 'VULNERABLE' in script_output: # Example for heartbleed
-                    facts.add_fact('ssl_heartbleed_detected', True)
-                if script_id == 'ftp-anon' and 'Anonymous FTP login allowed' in script_output:
-                    facts.add_fact('ftp_anon_allowed', True)
-
-
-    scaninfo = host_data.get('scaninfo', {})
-    if 'type' in scaninfo and 'services' in scaninfo:
-        facts.add_fact('initial_scan_type', f"{scaninfo['type']}_{scaninfo['services']}")
+                os_cpes = []
+                for os_class in best_os_match.findall('osclass'):
+                    cpe_elem = os_class.find('cpe')
+                    if cpe_elem is not None:
+                        os_cpes.append(cpe_elem.text)
+                if os_cpes:
+                    facts.add_fact('os_cpes', sorted(list(set(os_cpes))))
+        
+        # Host Script Results (NSE)
+        hostscript_elem = target_host_elem.find('hostscript')
+        if hostscript_elem:
+            script_results = {}
+            for script_elem in hostscript_elem.findall('script'):
+                script_id = script_elem.get('id')
+                output = script_elem.get('output')
+                if script_id and output:
+                    script_results[script_id] = output
+                    facts.add_fact(f"script_output_{script_id}", output) # Add individual script output
+            if script_results:
+                facts.add_fact('host_script_results', script_results) # Add all script results as a dict
 
     return facts
 
-# --- Define the Rules (Updated with new operators and fact names) ---
-def define_nmap_rules(target_ip):
-    rules = []
-
-    # Initial Scan & Host Status Rules (High Priority)
-    rules.append(Rule(
-        rule_id="R000_INITIAL_SCAN_REQUIRED",
-        description="Trigger initial comprehensive Nmap scan if no scan data exists.",
-        conditions=[
-            {'fact': 'target_ip', 'op': 'not_exists', 'value': None}, # This condition needs to be inverted if SUBSCAN.py handles initial.
-            {'fact': 'scan_stage', 'op': 'not_exists', 'value': None} # This condition means scan_stage is not set.
-        ],
-        actions=[
-            {'type': 'log', 'message': f"No initial scan data found. Triggering SUBSCAN.py for {target_ip}."},
-            {'type': 'add_fact', 'key': 'initial_scan_triggered', 'value': True},
-            {'type': 'update_scan_stage', 'value': 'initial_discovery_complete'}
-        ],
-        priority=100,
-        relevant_ports="N/A"
-    ))
-
-    rules.append(Rule(
-        rule_id="R001_HOST_IS_DOWN",
-        description="If host is down, no further scanning.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'initial_discovery_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'down'}
-        ],
-        actions=[
-            {'type': 'log', 'message': f"Host {target_ip} is reported as down. No further action."}
-        ],
-        priority=90,
-        relevant_ports="N/A"
-    ))
+# --- Fact Parsing from JSON ---
+def parse_nmap_json_report(nmap_raw_data, target_ip_hint=None):
+    """
+    Parses Nmap JSON-like report data (which comes from our internal consolidated structure)
+    into a FactBase. Can be given a target_ip_hint.
+    """
+    facts = FactBase()
+    if not nmap_raw_data:
+        print("Warning: No JSON data provided to parse_nmap_json_report.")
+        return facts
     
-    rules.append(Rule(
-        rule_id="R002_NO_OPEN_PORTS",
-        description="If host is up but no open ports found, suggest re-scan or termination.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'initial_discovery_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': '==', 'value': []}
-        ],
-        actions=[
-            {'type': 'log', 'message': f"Host {target_ip} is up but no open TCP ports found. Consider a full port scan (nmap -p- {target_ip}) or UDP scan."}
-        ],
-        priority=85,
-        relevant_ports="N/A"
-    ))
+    hosts_data = []
+    # Expects nmap_raw_data to be like {"nmaprun": {"host": [...]}} or just [...]
+    if isinstance(nmap_raw_data, dict) and 'nmaprun' in nmap_raw_data and 'host' in nmap_raw_data['nmaprun']:
+        hosts_data = nmap_raw_data['nmaprun']['host']
+        if not isinstance(hosts_data, list): # Ensure hosts_data is always a list
+            hosts_data = [hosts_data]
+    elif isinstance(nmap_raw_data, list): # Directly a list of host entries
+        hosts_data = nmap_raw_data
+    else:
+        print("Warning: Unexpected Nmap report data format for JSON parsing. Cannot parse facts.")
+        return facts
 
-    # Optimization Rule (High Priority, to refine initial discovery)
-    rules.append(Rule(
-        rule_id="R200_TARGETED_PORT_SCAN",
-        description="If scan_stage is 'initial_discovery_complete' and some open ports were found, but not all common ones, perform a more targeted scan on unlisted common ports.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'initial_discovery_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'is_not_empty', 'value': None}, # Ensure some ports are open
-            {'fact': 'targeted_port_scan_done', 'op': 'not_exists', 'value': None},
-            {'fact': 'open_tcp_ports', 'op': 'does_not_contain_all', 'value': [21, 22, 23, 25, 53, 80, 110, 139, 443, 445, 3389, 8080]}
-        ],
-        actions=[
-            {'type': 'log', 'message': f"Performing targeted scan on {target_ip} for specific common ports not yet discovered."},
-            {'type': 'nmap_command', 'command': f"nmap -p 21,22,23,25,53,80,110,139,443,445,3389,8080 --reason {target_ip}"},
-            {'type': 'add_fact', 'key': 'targeted_port_scan_done', 'value': True}
-        ],
-        priority=88,
-        relevant_ports=[21, 22, 23, 25, 53, 80, 110, 139, 443, 445, 3389, 8080]
-    ))
-
-    # General Service/Vulnerability Scans (Transitioning from Initial to Detailed)
-    rules.append(Rule(
-        rule_id="R300_SERVICE_VERSIONING_SUPPLEMENTAL",
-        description="Run comprehensive service version detection if not fully done by initial scan.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'initial_discovery_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'is_not_empty', 'value': None},
-            {'fact': 'full_service_scan_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -sV -p {{fact:open_tcp_ports}} {target_ip}"},
-            {'type': 'add_fact', 'key': 'full_service_scan_done', 'value': True},
-            {'type': 'update_scan_stage', 'value': 'detailed_service_analysis'}
-        ],
-        priority=70,
-        relevant_ports="All Open TCP Ports" 
-    ))
-
-    rules.append(Rule(
-        rule_id="R400_GENERAL_VULN_SCRIPTS_SUPPLEMENTAL",
-        description="Run general vulnerability scripts if not covered by initial scan.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'detailed_service_analysis'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'is_not_empty', 'value': None},
-            {'fact': 'general_vuln_scripts_run', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap --script 'vuln' -p {{fact:open_tcp_ports}} {target_ip}"},
-            {'type': 'add_fact', 'key': 'general_vuln_scripts_run', 'value': True},
-            {'type': 'update_scan_stage', 'value': 'vulnerability_identification_complete'}
-        ],
-        priority=68, # Slightly lower priority than R300 to ensure versioning happens first
-        relevant_ports="All Open TCP Ports" 
-    ))
-
-    # Deeper Service-Specific Enumeration (Post-R300/R400)
-
-    rules.append(Rule(
-        rule_id="R112_FTP_ENUMERATION",
-        description="Enumerate FTP service for anonymous login, writable directories, and common vulnerabilities.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'contains', 'value': 21},
-            {'fact': 'port_21_service', 'op': 'contains', 'value': 'ftp'},
-            {'fact': 'ftp_enum_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p 21 --script ftp-anon,ftp-brute,ftp-enum,ftp-vsftpd-backdoor,ftp-proftpd-backdoor {target_ip}"},
-            {'type': 'add_fact', 'key': 'ftp_enum_done', 'value': True}
-        ],
-        priority=67, # Adjusted priority
-        relevant_ports=[21]
-    ))
-
-    rules.append(Rule(
-        rule_id="R104_SSH_ENUMERATION",
-        description="Enumerate SSH service for supported authentication methods and versions, and identify potential vulnerabilities.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'contains', 'value': 22},
-            {'fact': 'port_22_service', 'op': 'contains', 'value': 'ssh'},
-            {'fact': 'ssh_enum_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p 22 --script ssh-auth-methods,ssh-hostkey,ssh-brute,ssh-publickey-accept {target_ip}"},
-            {'type': 'add_fact', 'key': 'ssh_enum_done', 'value': True}
-        ],
-        priority=66, 
-        relevant_ports=[22]
-    ))
-
-    rules.append(Rule(
-        rule_id="R105_SMTP_ENUMERATION",
-        description="Enumerate SMTP service for user enumeration, open relays, and VRFY/EXPN command support.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            # Use 'contains_any_of' for multiple ports
-            {'fact': 'open_tcp_ports', 'op': 'contains_any_of', 'value': [25, 465, 587]}, 
-            # Use an 'or_group' for service checks on multiple ports
-            {'fact': 'port_25_service', 'op': 'contains', 'value': 'smtp', 'or_group': 'smtp_service_check'}, 
-            {'fact': 'port_465_service', 'op': 'contains', 'value': 'smtp', 'or_group': 'smtp_service_check'},
-            {'fact': 'port_587_service', 'op': 'contains', 'value': 'smtp', 'or_group': 'smtp_service_check'},
-            {'fact': 'smtp_enum_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p 25,465,587 --script smtp-commands,smtp-enum-users,smtp-open-relay,smtp-vuln-cve2010-4344,smtp-vuln-cve2011-1720 {target_ip}"},
-            {'type': 'add_fact', 'key': 'smtp_enum_done', 'value': True}
-        ],
-        priority=64,
-        relevant_ports=[25, 465, 587]
-    ))
-
-    rules.append(Rule(
-        rule_id="R106_MYSQL_ENUMERATION",
-        description="Enumerate MySQL service for common vulnerabilities and information disclosure.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'contains', 'value': 3306},
-            {'fact': 'port_3306_service', 'op': 'contains', 'value': 'mysql'},
-            {'fact': 'mysql_enum_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p 3306 --script mysql-enum,mysql-info,mysql-vuln-cve2012-2122,mysql-brute {target_ip}"},
-            {'type': 'add_fact', 'key': 'mysql_enum_done', 'value': True}
-        ],
-        priority=63,
-        relevant_ports=[3306]
-    ))
-
-    rules.append(Rule(
-        rule_id="R113_SMB_ENUMERATION", 
-        description="Enumerate SMB service for shares, users, and common vulnerabilities like MS17-010.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'contains_any_of', 'value': [139, 445]}, 
-            {'fact': 'port_139_service', 'op': 'contains', 'value': 'netbios-ssn', 'or_group': 'smb_service_check'},
-            {'fact': 'port_445_service', 'op': 'contains', 'value': 'microsoft-ds', 'or_group': 'smb_service_check'},
-            {'fact': 'smb_enum_done', 'op': 'not_exists', 'value': None} 
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p 139,445 --script smb-enum-shares,smb-enum-users,smb-os-discovery,smb-security-mode,smb-vuln-ms17-010 {target_ip}"},
-            {'type': 'add_fact', 'key': 'smb_enum_done', 'value': True}
-        ],
-        priority=72, 
-        relevant_ports=[139, 445]
-    ))
-
-    # Advanced Web Application Checks (Post-R101 HTTP Enumeration)
-    rules.append(Rule(
-        rule_id="R101_HTTP_ENUMERATION",
-        description="Run common web enumeration scripts for open HTTP/HTTPS ports.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'contains_any_of', 'value': [80, 443, 8080, 8443]},
-            {'fact': 'http_enum_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p {{fact:open_http_ports}} --script http-enum,http-title,http-headers,http-server-header {target_ip}"},
-            {'type': 'add_fact', 'key': 'http_enum_done', 'value': True}
-        ],
-        priority=65,
-        relevant_ports=[80, 443, 8080, 8443]
-    ))
-
-    rules.append(Rule(
-        rule_id="R107_WEBDAV_ENUMERATION",
-        description="Check for WebDAV enabled and enumerate directories and allowed methods.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_http_ports', 'op': 'is_not_empty', 'value': None}, 
-            {'fact': 'http_enum_done', 'op': '==', 'value': True},
-            {'fact': 'webdav_check_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p {{fact:open_http_ports}} --script http-webdav-scan,http-methods {target_ip}"},
-            {'type': 'add_fact', 'key': 'webdav_check_done', 'value': True}
-        ],
-        priority=60,
-        relevant_ports=[80, 443, 8080, 8443]
-    ))
-
-    rules.append(Rule(
-        rule_id="R108_HTTP_LOGIN_PAGE_DETECTION",
-        description="Detect common login pages to inform potential brute-force attempts and identify authentication mechanisms.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_http_ports', 'op': 'is_not_empty', 'value': None},
-            {'fact': 'http_enum_done', 'op': '==', 'value': True},
-            {'fact': 'http_login_check_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p {{fact:open_http_ports}} --script http-form-brute,http-auth-finder,http-login {target_ip}"},
-            {'type': 'add_fact', 'key': 'http_login_check_done', 'value': True}
-        ],
-        priority=58,
-        relevant_ports=[80, 443, 8080, 8443]
-    ))
-
-    rules.append(Rule(
-        rule_id="R109_HTTP_DIR_BRUTE",
-        description="Perform extensive directory and file enumeration for common paths, and scan for common web vulnerabilities.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_http_ports', 'op': 'is_not_empty', 'value': None},
-            {'fact': 'http_enum_done', 'op': '==', 'value': True},
-            {'fact': 'http_dir_brute_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p {{fact:open_http_ports}} --script http-enum,http-robots.txt,http-sitemap-generator,http-vuln-cve2014-8877,http-shellshock {target_ip}"},
-            {'type': 'add_fact', 'key': 'http_dir_brute_done', 'value': True}
-        ],
-        priority=55,
-        relevant_ports=[80, 443, 8080, 8443]
-    ))
+    target_host_entry = None
+    if target_ip_hint: # Try to find the specific host if a hint is provided
+        for host_entry in hosts_data:
+            for addr_info in host_entry.get('addresses', []):
+                if addr_info.get('addrtype') == 'ipv4' and addr_info.get('addr') == target_ip_hint:
+                    target_host_entry = host_entry
+                    break
+            if target_host_entry:
+                break
     
-    rules.append(Rule(
-        rule_id="R102_SSL_TLS_VULN_CHECK",
-        description="Run SSL/TLS vulnerability scripts for open HTTPS ports.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'contains', 'value': 443},
-            {'fact': 'port_443_service', 'op': 'contains', 'value': 'https'},
-            {'fact': 'ssl_tls_check_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -p 443 --script ssl-enum-ciphers,ssl-heartbleed,ssl-poodle,ssl-ccs-injection,tls-sni {target_ip}"},
-            {'type': 'add_fact', 'key': 'ssl_tls_check_done', 'value': True}
-        ],
-        priority=80,
-        relevant_ports=[443]
-    ))
+    # If no specific target_ip_hint host found, or no hint, just take the first host
+    if not target_host_entry and hosts_data:
+        target_host_entry = hosts_data[0]
 
-    # General Vulnerability Checks
-    rules.append(Rule(
-        rule_id="R110_DNS_ENUMERATION",
-        description="Check for DNS server vulnerabilities like zone transfer and cache snooping.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_udp_ports', 'op': 'contains', 'value': 53}, 
-            {'fact': 'udp_port_53_service', 'op': 'contains', 'value': 'domain'}, # Changed to udp_port_53_service
-            {'fact': 'dns_enum_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -sU -p 53 --script dns-enum,dns-zone-transfer,dns-recursion,dns-brute {target_ip}"},
-            {'type': 'add_fact', 'key': 'dns_enum_done', 'value': True}
-        ],
-        priority=65,
-        relevant_ports=[53]
-    ))
+    if target_host_entry:
+        # IP Address
+        for addr_info in target_host_entry.get('addresses', []):
+            if addr_info.get('addrtype') == 'ipv4':
+                facts.add_fact('target_ip', addr_info.get('addr'))
+                break
+        
+        # Host State
+        if 'status' in target_host_entry:
+            facts.add_fact('host_state', target_host_entry['status'].get('state'))
 
-    rules.append(Rule(
-        rule_id="R111_SNMP_ENUMERATION",
-        description="Attempt to enumerate SNMP public community strings and gather system information.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': 'in', 'value': ['detailed_service_analysis', 'vulnerability_identification_complete']},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_udp_ports', 'op': 'contains', 'value': 161},
-            {'fact': 'udp_port_161_service', 'op': 'contains', 'value': 'snmp'}, # Changed to udp_port_161_service
-            {'fact': 'snmp_enum_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'nmap_command', 'command': f"nmap -sU -p 161 --script snmp-brute,snmp-info,snmp-interfaces,snmp-sysdescr {target_ip}"},
-            {'type': 'add_fact', 'key': 'snmp_enum_done', 'value': True}
-        ],
-        priority=62,
-        relevant_ports=[161]
-    ))
+        # Ports and Services
+        open_tcp_ports = []
+        open_udp_ports = []
+        open_http_ports = []
+        open_https_ports = []
+        known_services = []
 
+        if 'ports' in target_host_entry and 'port' in target_host_entry['ports']:
+            ports_list = target_host_entry['ports']['port']
+            if not isinstance(ports_list, list): # Handle single port as a dict, not list
+                ports_list = [ports_list]
+            
+            for port_info in ports_list:
+                if port_info.get('state', {}).get('state') == 'open':
+                    port_id = int(port_info.get('portid'))
+                    protocol = port_info.get('protocol')
+                    service_name = port_info.get('service', {}).get('name')
+                    service_product = port_info.get('service', {}).get('product')
+                    service_version = port_info.get('service', {}).get('version')
+                    
+                    if protocol == 'tcp':
+                        open_tcp_ports.append(port_id)
+                        if service_name and ('http' in service_name or 'ssl/http' in service_name):
+                            open_http_ports.append(port_id)
+                        if 'ssl/https' in service_name or port_id == 443:
+                             open_https_ports.append(port_id)
+                        if service_name in ["ftp", "ssh", "mysql", "microsoft-ds", "msrpc", "rdp"]:
+                            facts.add_fact(f"service_open_{service_name}", True)
 
-    # Post-Scan Analysis and Suggestions (Lower Priority)
-    rules.append(Rule(
-        rule_id="R500_EXPLOIT_METASPLOIT_FTP_ANON",
-        description="Suggest Metasploit for anonymous FTP login if found.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'vulnerability_identification_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'port_21_state', 'op': '==', 'value': 'open'},
-            {'fact': 'port_21_service', 'op': 'contains', 'value': 'ftp'},
-            {'fact': 'ftp_anon_allowed', 'op': '==', 'value': True} # Changed to specific fact
-        ],
-        actions=[
-            {'type': 'log', 'message': f"[EXPLOIT SUGGESTION] Anonymous FTP access on {target_ip}:21. Consider using Metasploit 'ftp_login' module or manual exploitation."}
-        ],
-        priority=79,
-        relevant_ports=[21]
-    ))
+                    elif protocol == 'udp':
+                        open_udp_ports.append(port_id)
+                    
+                    if service_name:
+                        known_services.append(service_name)
+                    if service_product:
+                        facts.add_fact(f"service_product_{port_id}", service_product)
+                    if service_version:
+                        facts.add_fact(f"service_version_{port_id}", service_version)
+        
+        facts.add_fact('open_tcp_ports', sorted(list(set(open_tcp_ports))))
+        facts.add_fact('open_udp_ports', sorted(list(set(open_udp_ports))))
+        facts.add_fact('open_http_ports', sorted(list(set(open_http_ports))))
+        facts.add_fact('open_https_ports', sorted(list(set(open_https_ports))))
+        facts.add_fact('known_services', sorted(list(set(known_services))))
 
-    rules.append(Rule(
-        rule_id="R501_EXPLOIT_SMB_MS17_010",
-        description="Suggest Metasploit for EternalBlue (MS17-010) if vulnerable.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'vulnerability_identification_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'port_445_state', 'op': '==', 'value': 'open'},
-            {'fact': 'smb_vuln_ms17_010_detected', 'op': '==', 'value': True} # Changed to specific fact
-        ],
-        actions=[
-            {'type': 'log', 'message': f"[EXPLOIT SUGGESTION] Host {target_ip} is vulnerable to MS17-010 (EternalBlue) on port 445. Consider using Metasploit 'exploit/windows/smb/ms17_010_eternalblue' or 'exploit/windows/smb/ms17_010_psexec'."}
-        ],
-        priority=60,
-        relevant_ports=[445]
-    ))
+        # OS Detection
+        if 'os' in target_host_entry and 'osmatch' in target_host_entry['os']:
+            os_matches = target_host_entry['os']['osmatch']
+            if isinstance(os_matches, dict): # Handle single osmatch as a dict
+                os_matches = [os_matches]
+            if os_matches:
+                best_os_match = os_matches[0]
+                facts.add_fact('os_name', best_os_match.get('name'))
+                facts.add_fact('os_accuracy', int(best_os_match.get('accuracy')))
+                
+                os_cpes = []
+                if 'osclass' in best_os_match:
+                    os_classes = best_os_match['osclass']
+                    if isinstance(os_classes, dict):
+                        os_classes = [os_classes]
+                    for os_class in os_classes:
+                        if 'cpe' in os_class:
+                            if isinstance(os_class['cpe'], list):
+                                os_cpes.extend(os_class['cpe'])
+                            else:
+                                os_cpes.append(os_class['cpe'])
+                if os_cpes:
+                    facts.add_fact('os_cpes', sorted(list(set(os_cpes))))
+        
+        # Host Script Results
+        if 'hostscript' in target_host_entry:
+            script_results = {}
+            hostscript_list = target_host_entry['hostscript']
+            if not isinstance(hostscript_list, list):
+                hostscript_list = [hostscript_list]
+            for script_output in hostscript_list:
+                script_id = script_output.get('id')
+                output = script_output.get('output')
+                if script_id and output:
+                    script_results[script_id] = output
+                    facts.add_fact(f"script_output_{script_id}", output)
+            if script_results:
+                facts.add_fact('host_script_results', script_results)
 
-    rules.append(Rule(
-        rule_id="R502_EXPLOIT_HTTP_COMMON_VULNS",
-        description="Suggest general web exploitation if HTTP vulns are detected.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'vulnerability_identification_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_http_ports', 'op': 'is_not_empty', 'value': None}, 
-            {'fact': 'http_enum_done', 'op': '==', 'value': True}, # Ensure enum was done to have script output
-            {'fact': 'script_output_http-enum', 'op': 'exists', 'value': None} # More general check
-        ],
-        actions=[
-            {'type': 'log', 'message': f"[EXPLOIT SUGGESTION] Web server on {target_ip}:80/443 likely has vulnerabilities. Consider using Burp Suite, OWASP ZAP, or specific web exploit frameworks."}
-        ],
-        priority=20,
-        relevant_ports=[80,443]
-    ))
-    
-    rules.append(Rule(
-        rule_id="R503_EXPLOIT_BRUTE_FORCE_GENERIC",
-        description="Suggest brute-forcing if common login services (SSH, FTP, HTTP, Telnet, SMB) are found.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'vulnerability_identification_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_tcp_ports', 'op': 'contains_any_of', 'value': [21, 22, 23, 80, 443, 139, 445]}, 
-            {'fact': 'brute_force_suggestion_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'log', 'message': f"[EXPLOIT SUGGESTION] Common login services detected on {target_ip}. Consider credential brute-forcing using tools like Hydra, Medusa, or CrackMapExec (for SMB)."},
-            {'type': 'add_fact', 'key': 'brute_force_suggestion_done', 'value': True}
-        ],
-        priority=15,
-        relevant_ports=[21, 22, 23, 80, 443, 139, 445]
-    ))
+    return facts
 
-    rules.append(Rule(
-        rule_id="R504_EXPLOIT_MANUAL_WEB_REVIEW",
-        description="If web services are present, suggest deeper manual review and specialized web application scanning.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'vulnerability_identification_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            {'fact': 'open_http_ports', 'op': 'is_not_empty', 'value': None},
-            {'fact': 'manual_web_review_suggestion_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'log', 'message': f"[EXPLOIT SUGGESTION] Active web services on {target_ip}. Perform manual web application penetration testing using tools like Burp Suite or ZAP for vulnerabilities like SQLi, XSS, insecure direct object references, deserialization flaws, etc."},
-            {'type': 'add_fact', 'key': 'manual_web_review_suggestion_done', 'value': True}
-        ],
-        priority=12,
-        relevant_ports=[80, 443, 8080, 8443]
-    ))
+# --- Define Nmap Rules ---
+def define_nmap_rules(target_ip, nmap_executable_path):
+    """
+    Defines the set of Nmap scanning and enumeration rules based on discovered facts.
+    """
+    rules = [
+        # Priority 10: Initial Scan (should be handled by main, but included for completeness)
+        Rule(
+            rule_id="RULE_001_INITIAL_SCAN_REQUIRED",
+            description="Trigger initial Nmap scan if no previous scan data is found.",
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_scan_pending"},
+                {"fact": "target_ip", "op": "exists"}
+            ],
+            actions=[
+                {"type": "log", "message": "Initial scan is pending, beginning discovery for {fact:target_ip}."},
+                {"type": "update_scan_stage", "value": "initial_discovery_complete"}
+                # No Nmap command here as SUBSCAN.py handles initial discovery
+            ],
+            priority=10
+        ),
+        
+        # Priority 9: HTTP/HTTPS Enumeration (high priority for web services)
+        Rule(
+            rule_id="RULE_002_SERVICE_ENUM_HTTP_80_443",
+            description="Deep scan HTTP/HTTPS services on standard or discovered ports.",
+            relevant_ports=[80, 443],
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"},
+                {"fact": "http_enum_complete", "op": "not_exists"}, # Only fire once
+                {"fact": "open_http_ports", "op": "is_not_empty", "or_group": "http_ports_exist"},
+                {"fact": "open_https_ports", "op": "is_not_empty", "or_group": "http_ports_exist"}
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-p {{fact:open_http_ports}},{{fact:open_https_ports}} --script http-enum,http-headers,http-methods,ssl-enum-ciphers,tls-enum-ciphers,http-title -sV"},
+                {"type": "add_fact", "key": "http_enum_complete", "value": True},
+                {"type": "log", "message": "Initiating deep HTTP/HTTPS enumeration on ports: {fact:open_http_ports}, {fact:open_https_ports}."}
+            ],
+            priority=9
+        ),
 
-    rules.append(Rule(
-        rule_id="R505_VULN_PATCHING_SUGGESTION",
-        description="If specific high-impact vulnerabilities (e.g., MS17-010, Heartbleed) are identified, suggest patching.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'vulnerability_identification_complete'},
-            {'fact': 'host_status', 'op': '==', 'value': 'up'},
-            # Use an 'or_group' for these specific high-impact vulnerabilities
-            {'fact': 'smb_vuln_ms17_010_detected', 'op': '==', 'value': True, 'or_group': 'high_impact_vuln_check'},
-            {'fact': 'ssl_heartbleed_detected', 'op': '==', 'value': True, 'or_group': 'high_impact_vuln_check'},
-            {'fact': 'patching_suggestion_done', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'log', 'message': f"[VULNERABILITY REMEDIATION] Critical vulnerabilities detected on {target_ip}. Prioritize applying security patches and updates for affected services."},
-            {'type': 'add_fact', 'key': 'patching_suggestion_done', 'value': True}
-        ],
-        priority=18,
-        relevant_ports="N/A"
-    ))
+        # Priority 8: Specific Service Checks (FTP, MySQL)
+        Rule(
+            rule_id="RULE_003_SERVICE_ENUM_FTP_21",
+            description="Perform anonymous login check on FTP.",
+            relevant_ports=[21],
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"},
+                {"fact": "ftp_anon_checked", "op": "not_exists"}, # Only fire once
+                {"fact": "open_tcp_ports", "op": "contains", "value": 21},
+                {"fact": "service_product_21", "op": "fact_string_contains", "value": "Microsoft ftpd", "or_group": "ftp_identified"} # Check if it's Microsoft FTP or just open
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-p 21 --script ftp-anon -sV"},
+                {"type": "add_fact", "key": "ftp_anon_checked", "value": True},
+                {"type": "log", "message": "Checking FTP for anonymous login on port 21."}
+            ],
+            priority=8
+        ),
+        Rule(
+            rule_id="RULE_004_SERVICE_ENUM_MYSQL_3306",
+            description="Detect MySQL version and check for basic information.",
+            relevant_ports=[3306],
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"},
+                {"fact": "mysql_enum_complete", "op": "not_exists"}, # Only fire once
+                {"fact": "open_tcp_ports", "op": "contains", "value": 3306},
+                {"fact": "service_open_mysql", "op": "==", "value": True, "or_group": "mysql_identified"}
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-p 3306 --script mysql-info,mysql-databases,mysql-users -sV"},
+                {"type": "add_fact", "key": "mysql_enum_complete", "value": True},
+                {"type": "log", "message": "Initiating MySQL enumeration on port 3306."}
+            ],
+            priority=8
+        ),
 
-    # Final Scan Phase Rule
-    rules.append(Rule(
-        rule_id="R900_SCAN_PHASE_COMPLETE",
-        description="Indicate that the active scanning phase is considered complete.",
-        conditions=[
-            {'fact': 'scan_stage', 'op': '==', 'value': 'vulnerability_identification_complete'},
-            {'fact': 'full_service_scan_done', 'op': '==', 'value': True},
-            {'fact': 'general_vuln_scripts_run', 'op': '==', 'value': True},
-            {'fact': 'ftp_enum_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'http_enum_done', 'op': 'exists', 'value': None},
-            {'fact': 'ssl_tls_check_done', 'op': 'exists', 'value': None},
-            {'fact': 'smb_enum_done', 'op': 'exists', 'value': None},
-            {'fact': 'ssh_enum_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'smtp_enum_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'mysql_enum_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'webdav_check_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'http_login_check_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'http_dir_brute_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'dns_enum_done', 'op': 'exists', 'value': None}, 
-            {'fact': 'snmp_enum_done', 'op': 'exists', 'value': None}, 
-            # Make targeted_port_scan_done truly optional by making its condition `True` if it doesn't exist,
-            # or `== True` if it does. The 'optional': True field in the condition dictionary is just a marker,
-            # not directly used by the evaluation logic.
-            {'fact': 'targeted_port_scan_done', 'op': 'exists', 'value': None, 'optional': True, 'or_group': 'optional_scan_complete_check'},
-            {'fact': 'targeted_port_scan_done', 'op': '==', 'value': True, 'or_group': 'optional_scan_complete_check'},
-            {'fact': 'final_scan_stage_set', 'op': 'not_exists', 'value': None}
-        ],
-        actions=[
-            {'type': 'update_scan_stage', 'value': 'exploit_consideration_phase'},
-            {'type': 'add_fact', 'key': 'final_scan_stage_set', 'value': True},
-            {'type': 'log', 'message': "All active scanning rules have been processed. Proceeding to exploit consideration."}
-        ],
-        priority=10,
-        relevant_ports="N/A"
-    ))
+        # Priority 7: OS Detection Enhancement
+        Rule(
+            rule_id="RULE_005_OS_DETECTION_ENHANCEMENT",
+            description="If OS detection was not precise, try a more aggressive OS scan.",
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"},
+                {"fact": "os_detection_enhanced", "op": "not_exists"}, # Only fire once
+                {"fact": "os_accuracy", "op": "!=", "value": 100, "or_group": "os_accuracy_low"}, # Nmap returns 100 for exact match
+                {"fact": "os_name", "op": "not_exists", "or_group": "os_accuracy_low"}
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-O --osscan-limit --max-os-tries 5 -sV"}, # -sV to ensure service info is still collected
+                {"type": "add_fact", "key": "os_detection_enhanced", "value": True},
+                {"type": "log", "message": "Attempting more aggressive OS detection."}
+            ],
+            priority=7
+        ),
 
+        # Priority 6: Vulnerability Scanning (Common CVEs)
+        Rule(
+            rule_id="RULE_006_VULN_SCAN_HTTP_COMMON_CVEs",
+            description="Run common HTTP vulnerability scripts if HTTP ports are open.",
+            relevant_ports=[80, 443],
+            conditions=[
+                {"fact": "http_enum_complete", "op": "==", "value": True}, # Ensure enumeration happened first
+                {"fact": "http_vuln_scanned", "op": "not_exists"}, # Only fire once
+                {"fact": "open_http_ports", "op": "is_not_empty", "or_group": "http_ports_for_vuln"},
+                {"fact": "open_https_ports", "op": "is_not_empty", "or_group": "http_ports_for_vuln"}
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-p {{fact:open_http_ports}},{{fact:open_https_ports}} --script http-vuln-* -sV"},
+                {"type": "add_fact", "key": "http_vuln_scanned", "value": True},
+                {"type": "log", "message": "Running common HTTP vulnerability checks."}
+            ],
+            priority=6
+        ),
+        
+        Rule(
+            rule_id="RULE_006_VULN_SCAN_SMB",
+            description="Scan for common SMB vulnerabilities if SMB is detected.",
+            relevant_ports=[445, 139],
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"},
+                {"fact": "smb_vuln_scanned", "op": "not_exists"},
+                {"fact": "open_tcp_ports", "op": "contains", "value": 445, "or_group": "smb_ports_open"},
+                {"fact": "open_tcp_ports", "op": "contains", "value": 139, "or_group": "smb_ports_open"},
+                {"fact": "service_open_microsoft-ds", "op": "==", "value": True, "or_group": "smb_service_identified"}
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-p 139,445 --script smb-enum-shares,smb-vuln-ms17-010,smb-security-mode -sV"},
+                {"type": "add_fact", "key": "smb_vuln_scanned", "value": True},
+                {"type": "log", "message": "Running SMB enumeration and vulnerability checks."}
+            ],
+            priority=6
+        ),
+
+        # Priority 5: UDP Scan & Aggressive General Scan
+        Rule(
+            rule_id="RULE_007_UDP_SERVICE_SCAN",
+            description="Perform a more thorough UDP scan if UDP ports were found.",
+            relevant_ports=["udp"],
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"},
+                {"fact": "udp_scan_enhanced", "op": "not_exists"}, # Only fire once
+                {"fact": "open_udp_ports", "op": "is_not_empty"}
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-sU -p {{fact:open_udp_ports}} --version-intensity 9 -sV"},
+                {"type": "add_fact", "key": "udp_scan_enhanced", "value": True},
+                {"type": "log", "message": "Conducting enhanced UDP service detection on ports: {fact:open_udp_ports}."}
+            ],
+            priority=5
+        ),
+        Rule(
+            rule_id="RULE_008_AGGRESSIVE_GENERAL_SCAN",
+            description="Perform an aggressive scan if specific interesting services are found and not already done.",
+            relevant_ports="Host",
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"},
+                {"fact": "aggressive_scan_performed", "op": "not_exists"}, # Only fire once
+                {"fact": "known_services", "op": "contains_any_of", "value": ["ssh", "smb", "ms-sql", "rdp", "vnc", "postgresql", "ftp", "http", "https", "mysql"]}
+            ],
+            actions=[
+                {"type": "nmap_command", "command": f"-A -sC -sV"}, # -A includes OS detection, version detection, script scanning, and traceroute
+                {"type": "add_fact", "key": "aggressive_scan_performed", "value": True},
+                {"type": "log", "message": "Performing aggressive scan due to interesting services found. This includes OS detection, service enumeration, and default scripts."}
+            ],
+            priority=3 # Lower priority, as it's a catch-all if more specific rules didn't cover everything.
+        ),
+
+        # Priority 1: Final Report Generation (lowest priority, fires when other scans are likely complete)
+        Rule(
+            rule_id="RULE_009_FINAL_REPORT_GENERATION",
+            description="Signal completion and readiness for final report (implies no more active scans).",
+            conditions=[
+                {"fact": "scan_stage", "op": "==", "value": "initial_discovery_complete"}, # Must have completed initial discovery
+                {"fact": "final_report_ready", "op": "not_exists"}, # Only fire once
+                # These conditions are ORed within a group. If ANY of these are true, AND there are no further
+                # specific scans remaining to be done (which is implicitly handled by rules not firing),
+                # then this rule will eventually fire. This is a heuristic for "enough information".
+                # A more robust system would track active scan tasks or explicit "all_subtasks_complete" facts.
+                {"fact": "http_enum_complete", "op": "==", "value": True, "or_group": "all_enum_checks_done"},
+                {"fact": "ftp_anon_checked", "op": "==", "value": True, "or_group": "all_enum_checks_done"},
+                {"fact": "mysql_enum_complete", "op": "==", "value": True, "or_group": "all_enum_checks_done"},
+                {"fact": "os_detection_enhanced", "op": "==", "value": True, "or_group": "all_enum_checks_done"},
+                {"fact": "udp_scan_enhanced", "op": "==", "value": True, "or_group": "all_enum_checks_done"},
+                {"fact": "aggressive_scan_performed", "op": "==", "value": True, "or_group": "all_enum_checks_done"},
+                {"fact": "smb_vuln_scanned", "op": "==", "value": True, "or_group": "all_enum_checks_done"},
+                {"fact": "open_tcp_ports", "op": "is_not_empty", "or_group": "basic_discovery_done"} # At least something was found
+            ],
+            actions=[
+                {"type": "update_scan_stage", "value": "scan_complete"},
+                {"type": "add_fact", "key": "final_report_ready", "value": True},
+                {"type": "log", "message": "All relevant scans likely completed. Final report can be generated. Review result.json."}
+            ],
+            priority=1
+        )
+    ]
     return rules
 
+# --- Main Execution Block ---
 
-# --- Main Execution ---
 if __name__ == "__main__":
-    initial_scan_file_path = "scanout.json" # Initial scan file
-    consolidated_output_file_path = "consolidated_nmap_results.json" # New consolidated file
+    NMAP_EXECUTABLE_PATH = "/usr/bin/nmap" # Ensure this path is correct for your system
 
+    initial_scan_file_path = "output/scanout.xml" # SUBSCAN.py now outputs XML
+    consolidated_output_file_path = "output/result.json"
+
+    print("[main.py] Starting main execution block.") # DEBUG
+
+    initial_facts = FactBase()
     initial_target_ip = None
+    initial_scan_xml_content = None # To hold content of initial scanout.xml if it occurs
 
-    # --- Step 1: Check for initial scan data or trigger nmapscan.py ---
-    if not os.path.exists(initial_scan_file_path) or os.path.getsize(initial_scan_file_path) == 0:
-        print(f"'{initial_scan_file_path}' not found or is empty. Initial scan required.")
-        target_input = input("Enter target IP or URL for the initial scan: ").strip()
-        if not target_input:
-            print("No target provided. Exiting.")
-            sys.exit(1)
-        initial_target_ip = target_input
-        
-        print(f"Running initial scan using SUBSCAN.py against {initial_target_ip}...")
+    # Attempt to load existing consolidated data first
+    existing_consolidated_nmap_data = None
+    if os.path.exists(consolidated_output_file_path) and os.path.getsize(consolidated_output_file_path) > 0:
         try:
-            # Note: Ensure SUBSCAN.py is designed to take IP as input and output to scanout.json
-            process = subprocess.run(
-                ["python3", "SUBSCAN.py"],
-                input=f"{initial_target_ip}\n", # Pass target_ip via stdin
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            print(f"\nSUBSCAN.py stdout:\n{process.stdout}")
-            if process.stderr:
-                print(f"SUBSCAN.py stderr:\n{process.stderr}")
+            with open(consolidated_output_file_path, 'r') as f:
+                loaded_data = json.load(f)
+                if 'nmaprun' in loaded_data and 'host' in loaded_data['nmaprun']:
+                    existing_consolidated_nmap_data = loaded_data['nmaprun']['host']
+                    print(f"[main.py] Loaded existing consolidated data from {consolidated_output_file_path}.")
+                    # Parse facts from the existing consolidated data
+                    initial_facts = parse_nmap_json_report({"nmaprun": {"host": existing_consolidated_nmap_data}})
+                    initial_facts.add_fact('scan_stage', 'initial_discovery_complete') # Assume initial discovery done if data exists
+                    initial_target_ip = initial_facts.get_fact('target_ip')
+                    if not initial_target_ip:
+                        print("[main.py] Error: Could not determine target IP from existing consolidated data. Exiting.")
+                        sys.exit(1)
+                    print(f"[main.py] Target IP from consolidated data: {initial_target_ip}")
+                else:
+                    print(f"[main.py] Warning: Consolidated file '{consolidated_output_file_path}' has unexpected Nmaprun structure. Will proceed with initial scan.")
+        except json.JSONDecodeError:
+            print(f"[main.py] Warning: Existing consolidated file '{consolidated_output_file_path}' is not valid JSON. Will proceed with initial scan.")
+        except Exception as e:
+            print(f"[main.py] Error loading existing consolidated file '{consolidated_output_file_path}': {e}. Will proceed with initial scan.")
+    
+    # If no valid consolidated data was loaded, perform an initial scan
+    if not initial_facts.get_fact('target_ip'): # This means existing_consolidated_nmap_data was not successfully loaded
+        print("[main.py] No existing consolidated data or target IP found. Initial scan required.")
+        initial_target_ip = input("Enter target IP or URL for the initial scan: ").strip()
+        if not initial_target_ip:
+            print("[main.py] No target IP or URL provided. Exiting.")
+            sys.exit(1)
+        
+        initial_facts.add_fact('target_ip', initial_target_ip)
+        initial_facts.add_fact('scan_stage', 'initial_scan_pending')
 
-            if process.returncode != 0:
-                print(f"Warning: SUBSCAN.py exited with code {process.returncode}. Please check its output for errors.")
-            
-            time.sleep(1) # Give system a moment to write the file
+        print(f"[main.py] Running initial scan using SUBSCAN.py against {initial_target_ip}...")
+        
+        # Use subprocess to run SUBSCAN.py
+        # Pass target IP via stdin
+        subscan_process = subprocess.run(
+            ["python3", os.path.join(os.path.dirname(__file__), "SUBSCAN.py")],
+            input=initial_target_ip,
+            text=True,
+            capture_output=True,
+            check=False # Do not raise an exception for non-zero exit codes
+        )
+        print("SUBSCAN.py stdout:\n" + subscan_process.stdout)
+        print("SUBSCAN.py stderr:\n" + subscan_process.stderr)
 
+        if subscan_process.returncode != 0:
+            print(f"[main.py] Warning: SUBSCAN.py exited with code {subscan_process.returncode}. Please check its output for errors.")
+            # If SUBSCAN.py failed to produce the file, we can't proceed
             if not os.path.exists(initial_scan_file_path) or os.path.getsize(initial_scan_file_path) == 0:
-                print(f"Error: SUBSCAN.py failed to create a valid '{initial_scan_file_path}'. Exiting.")
+                print(f"[main.py] Error: SUBSCAN.py failed to create a valid '{initial_scan_file_path}'. Exiting.")
                 sys.exit(1)
-            else:
-                print(f"Initial scan data successfully generated in '{initial_scan_file_path}'.")
+        
+        try:
+            with open(initial_scan_file_path, 'r') as f:
+                initial_scan_xml_content = f.read()
+            print(f"[main.py] Successfully loaded initial scan data from {initial_scan_file_path}.")
         except FileNotFoundError:
-            print("Error: SUBSCAN.py not found. Make sure it's in the same directory and executable.")
+            print(f"[main.py] Error: Initial scan report file '{initial_scan_file_path}' not found after SUBSCAN.py execution. Exiting.")
             sys.exit(1)
         except Exception as e:
-            print(f"An error occurred while running SUBSCAN.py: {e}")
+            print(f"[main.py] An unexpected error occurred while reading {initial_scan_file_path}: {e}. Exiting.")
             sys.exit(1)
-            
-    # --- Step 2: Load initial facts and populate consolidated data ---
-    nmap_report_data = None
-    try:
-        with open(initial_scan_file_path, 'r') as f:
-            nmap_report_data = json.load(f)
-        print(f"Successfully loaded scan data from {initial_scan_file_path}")
-    except json.JSONDecodeError:
-        print(f"Error: {initial_scan_file_path} contains invalid JSON. Please check the file.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"An unexpected error occurred while reading {initial_scan_file_path}: {e}")
-        sys.exit(1)
+        
+        # Parse facts from the newly generated XML report
+        # Pass the target_ip_hint to ensure we parse the correct host if multiple are in the XML
+        initial_facts = parse_nmap_xml_report(initial_scan_xml_content, target_ip_hint=initial_target_ip)
+        
+        # Ensure target_ip and scan_stage are correctly set even if parsing missed them
+        if not initial_facts.get_fact('target_ip'):
+            initial_facts.add_fact('target_ip', initial_target_ip)
+        if not initial_facts.get_fact('scan_stage'):
+             initial_facts.add_fact('scan_stage', 'initial_discovery_complete') # Now that initial scan is done
 
-    initial_facts = parse_nmap_json_report(nmap_report_data)
-    
-    # If target_ip wasn't in scanout.json but was provided by user for SUBSCAN.py
-    if not initial_facts.get_fact('target_ip') and initial_target_ip:
-        initial_facts.add_fact('target_ip', initial_target_ip)
-
-    target_ip = initial_facts.get_fact('target_ip')
+    target_ip = initial_facts.get_fact('target_ip') # Final check for target IP
     if not target_ip:
-        print("Error: Could not determine target IP from the report. Exiting.")
+        print("[main.py] Error: Target IP is still not set after all attempts. Exiting.")
         sys.exit(1)
     
-    # Set initial scan stage if not already set by parsing
-    if not initial_facts.get_fact('scan_stage'):
-        initial_facts.add_fact('scan_stage', 'initial_discovery_complete')
-
-    print("\nInitial Facts for {}:".format(target_ip))
+    print("\nInitial Facts for {}:\n".format(target_ip))
     print(initial_facts)
 
-    # Initialize the consolidated_nmap_results.json with the initial scan data
-    try:
-        with open(consolidated_output_file_path, 'w') as f:
-            json.dump(nmap_report_data, f, indent=2)
-        print(f"Initial scan data written to consolidated file: {consolidated_output_file_path}")
-    except Exception as e:
-        print(f"Error writing initial scan data to consolidated file: {e}")
+    print("[main.py] Defining Nmap rules...") # DEBUG
+    rules = define_nmap_rules(target_ip, NMAP_EXECUTABLE_PATH)
+    print(f"[main.py] Defined {len(rules)} rules.") # DEBUG
 
-
-    # --- Step 3: Initialize and run the Inference Engine ---
-    rules = define_nmap_rules(target_ip)
+    print("[main.py] Initializing Inference Engine...") # DEBUG
     engine = InferenceEngine(initial_facts, rules, consolidated_output_file_path)
-    engine.run()
+    
+    # Crucial step: Initialize the engine's consolidated data if it's a fresh run
+    # and we just performed an initial XML scan. This sets up the base for merging.
+    if not existing_consolidated_nmap_data and initial_scan_xml_content:
+        print("[main.py] Initializing engine's consolidated data from initial XML scan.") # DEBUG
+        try:
+            xml_tree = ET.fromstring(initial_scan_xml_content)
+            root = xml_tree
+            converted_host_data = []
+            for host_elem in root.findall('host'):
+                host_json = _convert_xml_host_to_json_dict(host_elem)
+                if host_json:
+                    converted_host_data.append(host_json)
+            
+            if converted_host_data:
+                # Use consolidate_and_add_scan_data to populate the engine's internal consolidated_nmap_data
+                engine.consolidate_and_add_scan_data({"nmaprun": {"host": converted_host_data}})
+            else:
+                print("[main.py] Warning: No host data found in initial XML scan to convert for consolidation at engine init.")
+
+        except ET.ParseError as e:
+            print(f"[main.py] Error parsing initial XML content for engine consolidation: {e}")
+        except Exception as e:
+            print(f"[main.py] An unexpected error occurred during XML to JSON conversion for consolidation: {e}")
+
+    print("[main.py] Calling engine.run()...") # DEBUG - THIS IS THE KEY!
+    engine.run() # Start the inference process
+
+    print("[main.py] Engine.run() completed.") # DEBUG
+
+    # Clean up the temporary initial scan file
+    #if os.path.exists(initial_scan_file_path):
+     #   os.remove(initial_scan_file_path)
+      #  print(f"Cleaned up temporary initial scan file: {initial_scan_file_path}")
+
+    print("\nProcess complete. Check 'result.json' for consolidated scan data.")

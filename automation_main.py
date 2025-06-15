@@ -1,5 +1,6 @@
 from colorama import Fore, Style, init
 import random
+import subprocess
 
 init(autoreset=True)
 
@@ -36,3 +37,9 @@ def print_banner():
 # Example usage
 if __name__ == "__main__":
     print_banner()
+    try:
+      print(Fore.GREEN + Style.BRIGHT + "\n [*] (main2.py)NMAP SCANING  processing .......\n")
+      subprocess.run(["python3","/home/arunexploit/Penturion/AImodel/main.py"])
+      
+    except Exception as e:
+        print(Fore.RED + Style.BRIGHT + f" [!] Error running NMAPSCAN.py: {e}")
