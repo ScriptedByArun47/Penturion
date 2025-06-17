@@ -1,6 +1,4 @@
-# Version 3.0 - Advanced Scan Combination with Consolidated JSON Output (result.json)
-# This version focuses on robust XML parsing for initial scans, deep merging,
-# and a more comprehensive inference engine.
+# Version 3.1 - add penturion target ip in txt file  
 
 import json
 import os
@@ -1017,10 +1015,14 @@ if __name__ == "__main__":
                     initial_facts = parse_nmap_json_report({"nmaprun": {"host": existing_consolidated_nmap_data}})
                     initial_facts.add_fact('scan_stage', 'initial_discovery_complete') # Assume initial discovery done if data exists
                     initial_target_ip = initial_facts.get_fact('target_ip')
+                    
                     if not initial_target_ip:
                         print("[main.py] Error: Could not determine target IP from existing consolidated data. Exiting.")
                         sys.exit(1)
                     print(f"[main.py] Target IP from consolidated data: {initial_target_ip}")
+                    with open("output/penturion_target.txt", "w") as f:
+                        f.write(initial_target_ip)
+                        print(f"[main.py] Target IP written to penturion_target.txt: {initial_target_ip}")
                 else:
                     print(f"[main.py] Warning: Consolidated file '{consolidated_output_file_path}' has unexpected Nmaprun structure. Will proceed with initial scan.")
         except json.JSONDecodeError:
@@ -1032,10 +1034,13 @@ if __name__ == "__main__":
     if not initial_facts.get_fact('target_ip'): # This means existing_consolidated_nmap_data was not successfully loaded
         print("[main.py] No existing consolidated data or target IP found. Initial scan required.")
         initial_target_ip = input("Enter target IP or URL for the initial scan: ").strip()
+        
         if not initial_target_ip:
             print("[main.py] No target IP or URL provided. Exiting.")
             sys.exit(1)
-        
+        with open("output/penturion_target.txt", "w") as f:
+             f.write(initial_target_ip)
+             print(f"[main.py] Target IP written to /tmp/penturion_target.txt: {initial_target_ip}")
         initial_facts.add_fact('target_ip', initial_target_ip)
         initial_facts.add_fact('scan_stage', 'initial_scan_pending')
 

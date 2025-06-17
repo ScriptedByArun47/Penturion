@@ -24,7 +24,7 @@ import json
 try:
     import queue as Queue
 except:
-    import Queue
+    import queue as Queue
 
 #The 'multiprocessing' library does not rely upon a Global Interpreter Lock (GIL)
 import multiprocessing
@@ -67,7 +67,7 @@ class verify_nameservers(multiprocessing.Process):
             #Lets test the letancy of our connection.
             #Google's DNS server should be an ideal time test.
             resolver.nameservers = ['8.8.8.8']
-            resolver.query(self.most_popular_website, self.record_type)
+            resolver.resolve(self.most_popular_website, self.record_type)
         except:
             #Our connection is slower than a junebug in molasses
             resolver = dns.resolver.Resolver()
@@ -98,7 +98,7 @@ class verify_nameservers(multiprocessing.Process):
             if server:
                 self.resolver.nameservers = [server]
                 try:
-                    #test_result = self.resolver.query(self.most_popular_website, "A")
+                    #test_result = self.resolver.resolve(self.most_popular_website, "A")
                     #should throw an exception before this line.
                     if True:#test_result:
                         #Only add the nameserver to the queue if we can detect wildcards. 
@@ -138,7 +138,7 @@ class verify_nameservers(multiprocessing.Process):
         #I have seen a CloudFlare Enterprise customer with the first two conditions.
         try:
             #This is case #3,  these spam nameservers seem to be more trouble then they are worth.
-             wildtest = self.resolver.query(uuid.uuid4().hex + ".com", "A")
+             wildtest = self.resolver.resolve(uuid.uuid4().hex + ".com", "A")
              if len(wildtest):
                 trace("Spam DNS detected:", host)
                 return False
@@ -152,7 +152,7 @@ class verify_nameservers(multiprocessing.Process):
             test_counter -= 1            
             try:
                 testdomain = "%s.%s" % (uuid.uuid4().hex, host)
-                wildtest = self.resolver.query(testdomain, self.record_type)
+                wildtest = self.resolver.resolve(testdomain, self.record_type)
                 #This 'A' record may contain a list of wildcards.
                 if wildtest:
                     for w in wildtest:
@@ -224,7 +224,7 @@ class lookup(multiprocessing.Process):
             try:
                 #Query the nameserver, this is not simple...
                 if not record_type or record_type == "A":
-                    resp = self.resolver.query(host)
+                    resp = self.resolver.resolve(host)
                     #Crawl the response
                     hosts = extract_hosts(str(resp.response), self.domain)
                     for h in hosts:
@@ -237,7 +237,7 @@ class lookup(multiprocessing.Process):
                     #A max 20 lookups
                     for x in range(20):
                         try:
-                            resp = self.resolver.query(host, record_type)
+                            resp = self.resolver.resolve(host, record_type)
                         except dns.resolver.NoAnswer:
                             resp = False
                             pass
@@ -248,7 +248,7 @@ class lookup(multiprocessing.Process):
                             return cname_record                    
                 else:
                     #All other records:
-                    return self.resolver.query(host, record_type)
+                    return self.resolver.resolve(host, record_type)
 
             except Exception as e:
                 if type(e) == dns.resolver.NoNameservers:
@@ -371,7 +371,7 @@ def extract_hosts(data, hostname):
 
 #Return a list of unique sub domains,  sorted by frequency.
 #Only match domains that have 3 or more sections subdomain.domain.tld
-domain_match = re.compile("([a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*)+")
+domain_match = re.compile(r"([a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*)+")
 def extract_subdomains(file_name):
     #Avoid re-compilation
     global domain_match
@@ -404,7 +404,7 @@ def extract_subdomains(file_name):
     subs_sorted = sorted(subs.keys(), key = lambda x: subs[x], reverse = True)
     return subs_sorted
 
-def print_target(target, record_type = None, subdomains = "names.txt", resolve_list = "resolvers.txt", process_count = 16, output = False, json_output = False, found_subdomains=[],verbose=False):
+def print_target(target, record_type = None, subdomains = "names.txt", resolve_list = "fast_resolvers.txt", process_count = 16, output = False, json_output = False, found_subdomains=[],verbose=False):
     subdomains_list = []
     results_temp = []
     run(target, record_type, subdomains, resolve_list, process_count)
@@ -421,7 +421,7 @@ def print_target(target, record_type = None, subdomains = "names.txt", resolve_l
 
     return  set(subdomains_list)
 
-def run(target, record_type = None, subdomains = "names.txt", resolve_list = "resolvers.txt", process_count = 16):
+def run(target, record_type = None, subdomains = "names.txt", resolve_list = "fast_resolvers.txt", process_count = 16):
     subdomains = check_open(subdomains)
     resolve_list = check_open(resolve_list)
     if (len(resolve_list) / 16) < process_count:
@@ -561,8 +561,8 @@ if __name__ == "__main__":
     parser = optparse.OptionParser("usage: %prog [options] target")
     parser.add_option("-s", "--subs", dest = "subs", default = os.path.join(base_path, "names.txt"),
               type = "string", help = "(optional) list of subdomains,  default = 'names.txt'")
-    parser.add_option("-r", "--resolvers", dest = "resolvers", default = os.path.join(base_path, "resolvers.txt"),
-              type = "string", help = "(optional) A list of DNS resolvers, if this list is empty it will OS's internal resolver default = 'resolvers.txt'")
+    parser.add_option("-r", "--resolvers", dest = "resolvers", default = os.path.join(base_path, "fast_resolvers.txt"),
+              type = "string", help = "(optional) A list of DNS resolvers, if this list is empty it will OS's internal resolver default = 'fast_resolvers.txt'")
     parser.add_option("-t", "--targets_file", dest = "targets", default = "",
               type = "string", help = "(optional) A file containing a newline delimited list of domains to brute force.")
     parser.add_option("-o", "--output", dest = "output",  default = False, help = "(optional) Output to file (Greppable Format)")
