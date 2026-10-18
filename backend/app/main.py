@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.api.routes.projects import router as projects_router
 
 app = FastAPI(
     title="PENTURION API",
@@ -32,3 +33,4 @@ def root():
         "message": "Welcome to PENTURION",
         "docs": "/docs",
     }
+app.include_router(projects_router, prefix="/api/v1")
