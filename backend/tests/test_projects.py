@@ -1,0 +1,146 @@
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.main import app
+from app.core.database import Base, get_db
+from app.models import Project, Target
+
+
+@pytest.fixture
+def client():
+    # An isolated in-memory SQLite database for each test.
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    TestingSessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=test_engine,
+    )
+
+    Base.metadata.create_all(bind=test_engine)
+
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    app.dependency_overrides.clear()
+    Base.metadata.drop_all(bind=test_engine)
+    test_engine.dispose()
+
+
+def test_health_check(client):
+    response = client.get("/api/v1/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+
+
+def test_list_projects_empty(client):
+    response = client.get("/api/v1/projects")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_create_and_retrieve_project(client):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={
+            "name": "Automated Test Project",
+            "description": "Testing with an isolated database",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    project = create_response.json()
+    assert project["name"] == "Automated Test Project"
+    assert project["status"] == "active"
+
+    project_id = project["id"]
+
+    get_response = client.get(f"/api/v1/projects/{project_id}")
+
+    assert get_response.status_code == 200
+    assert get_response.json()["id"] == project_id
+
+
+def test_get_nonexistent_project(client):
+    response = client.get(
+        "/api/v1/projects/00000000-0000-0000-0000-000000000000"
+    )
+
+    assert response.status_code == 404
+
+
+def test_create_project_without_name(client):
+    response = client.post(
+        "/api/v1/projects",
+        json={"description": "Missing project name"},
+    )
+
+    assert response.status_code == 422
+    
+def test_update_project(client):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={
+            "name": "Original Project",
+            "description": "Before update",
+        },
+    )
+
+    assert create_response.status_code == 201
+    project_id = create_response.json()["id"]
+
+    update_response = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={
+            "name": "Updated Project",
+            "description": "After update",
+        },
+    )
+
+    assert update_response.status_code == 200
+    assert update_response.json()["name"] == "Updated Project"
+    assert update_response.json()["description"] == "After update"
+
+
+def test_delete_project(client):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={
+            "name": "Project To Delete",
+            "description": "Delete endpoint test",
+        },
+    )
+
+    assert create_response.status_code == 201
+    project_id = create_response.json()["id"]
+
+    delete_response = client.delete(
+        f"/api/v1/projects/{project_id}"
+    )
+
+    assert delete_response.status_code == 204
+
+    get_response = client.get(
+        f"/api/v1/projects/{project_id}"
+    )
+
+    assert get_response.status_code == 404

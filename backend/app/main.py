@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.projects import router as projects_router
+from app.api.routes.targets import router as targets_router
 
 app = FastAPI(
     title="PENTURION API",
@@ -34,3 +35,4 @@ def root():
         "docs": "/docs",
     }
 app.include_router(projects_router, prefix="/api/v1")
+app.include_router(targets_router, prefix="/api/v1")
