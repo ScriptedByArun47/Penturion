@@ -4,9 +4,13 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.schemas.target import TargetCreate, TargetUpdate, TargetResponse
 from app.services import target_service
+from app.api.dependencies import get_current_user
 
 
-router = APIRouter(tags=["Targets"])
+router = APIRouter(
+    tags=["Targets"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 @router.post(

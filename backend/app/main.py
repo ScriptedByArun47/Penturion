@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.projects import router as projects_router
 from app.api.routes.targets import router as targets_router
 from app.api.routes.authorization import router as authorization_router
+from app.api.routes.auth import router as auth_router
 
 app = FastAPI(
     title="PENTURION API",
@@ -38,3 +39,4 @@ def root():
 app.include_router(projects_router, prefix="/api/v1")
 app.include_router(targets_router, prefix="/api/v1")
 app.include_router(authorization_router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")

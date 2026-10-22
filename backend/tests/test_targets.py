@@ -6,6 +6,8 @@ from app.core.database import get_db, Base
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from app.core.security import create_access_token
+from app.models.user import User
 
 
 @pytest.fixture
@@ -40,10 +42,36 @@ def client():
     Base.metadata.drop_all(bind=engine)
     engine.dispose()
 
+@pytest.fixture
+def auth_client(client):
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+
+    try:
+        user = User(
+            email="targets-reviewer@example.com",
+            password_hash="test-only-placeholder",
+            role="reviewer",
+            is_active=True,
+        )
+
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        token = create_access_token(user.id)
+    finally:
+        db_generator.close()
+
+    client.headers.update(
+        {"Authorization": f"Bearer {token}"}
+    )
+    return client
+
 
 @pytest.fixture
-def project_id(client):
-    response = client.post(
+def project_id(auth_client):
+    response = auth_client.post(
         "/api/v1/projects",
         json={
             "name": "Target API Test Project",
@@ -56,8 +84,8 @@ def project_id(client):
     return response.json()["id"]
 
 
-def test_create_target(client, project_id):
-    response = client.post(
+def test_create_target(auth_client, project_id):
+    response = auth_client.post(
         f"/api/v1/projects/{project_id}/targets",
         json={
             "value": "example.com",
@@ -92,8 +120,8 @@ def test_list_project_targets(client, project_id):
     assert len(response.json()) == 1
 
 
-def test_create_target_for_missing_project(client):
-    response = client.post(
+def test_create_target_for_missing_project(auth_client):
+    response = auth_client.post(
         "/api/v1/projects/nonexistent-project/targets",
         json={
             "value": "example.com",
@@ -104,8 +132,8 @@ def test_create_target_for_missing_project(client):
     assert response.status_code == 404
 
 
-def test_create_target_rejects_empty_value(client, project_id):
-    response = client.post(
+def test_create_target_rejects_empty_value(auth_client, project_id):
+    response = auth_client.post(
         f"/api/v1/projects/{project_id}/targets",
         json={
             "value": "   ",
@@ -116,8 +144,8 @@ def test_create_target_rejects_empty_value(client, project_id):
     assert response.status_code == 422
 
 
-def test_create_target_cannot_set_authorization(client, project_id):
-    response = client.post(
+def test_create_target_cannot_set_authorization(auth_client, project_id):
+    response = auth_client.post(
         f"/api/v1/projects/{project_id}/targets",
         json={
             "value": "example.com",

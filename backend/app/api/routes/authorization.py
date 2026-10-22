@@ -11,9 +11,14 @@ from app.schemas.authorization import (
 )
 from app.services import authorization_service
 
+
+from app.models.user import User
+from app.api.dependencies import get_current_user, require_reviewer
+
 router = APIRouter(
     prefix="/authorization-requests",
     tags=["Authorization"],
+    dependencies=[Depends(get_current_user)],
 )
 
 
@@ -82,19 +87,21 @@ def review_request(
     request_id: str,
     review_data: AuthorizationReview,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_reviewer),
 ):
     try:
         request = authorization_service.review_authorization_request(
             db=db,
             request_id=request_id,
             review_data=review_data,
+            reviewed_by=current_user.id,
         )
     except ValueError as exc:
         message = str(exc)
 
         code = (
             status.HTTP_404_NOT_FOUND
-            if message in {"Target not found"}
+            if message == "Target not found"
             else status.HTTP_409_CONFLICT
         )
 

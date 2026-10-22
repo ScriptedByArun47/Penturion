@@ -8,6 +8,9 @@ from sqlalchemy.pool import StaticPool
 from app.main import app
 from app.core.database import Base, get_db
 
+from app.core.security import create_access_token
+from app.models.user import User
+
 
 @pytest.fixture
 def client():
@@ -43,8 +46,43 @@ def client():
 
 
 @pytest.fixture
-def target_id(client):
-    project_response = client.post(
+def auth_client(client, reviewer_token):
+    token, _ = reviewer_token
+    client.headers.update(
+        {"Authorization": f"Bearer {token}"}
+    )
+    return client
+
+
+@pytest.fixture
+def reviewer_token(client):
+    from app.core.database import get_db
+
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+
+    try:
+        reviewer = User(
+            email="reviewer@example.com",
+            password_hash="test-only-not-a-real-password-hash",
+            role="reviewer",
+            is_active=True,
+        )
+
+        db.add(reviewer)
+        db.commit()
+        db.refresh(reviewer)
+
+        token = create_access_token(reviewer.id)
+        return token, reviewer.id
+    finally:
+        db_generator.close()
+
+
+
+@pytest.fixture
+def target_id(auth_client):
+    project_response = auth_client.post(
         "/api/v1/projects",
         json={
             "name": "Authorization Test Project",
@@ -56,7 +94,7 @@ def target_id(client):
     assert project_response.status_code == 201
     project_id = project_response.json()["id"]
 
-    target_response = client.post(
+    target_response = auth_client.post(
         f"/api/v1/projects/{project_id}/targets",
         json={
             "value": "example.com",
@@ -70,8 +108,8 @@ def target_id(client):
 
 
 @pytest.fixture
-def authorization_request(client, target_id):
-    response = client.post(
+def authorization_request(auth_client, target_id):
+    response = auth_client.post(
         "/api/v1/authorization-requests",
         json={
             "target_id": target_id,
@@ -86,10 +124,10 @@ def authorization_request(client, target_id):
 
 
 def test_create_authorization_request(
-    client,
+    auth_client,
     target_id,
 ):
-    response = client.post(
+    response = auth_client.post(
         "/api/v1/authorization-requests",
         json={
             "target_id": target_id,
@@ -107,8 +145,8 @@ def test_create_authorization_request(
     assert data["reviewed_by"] is None
 
 
-def test_create_request_for_missing_target(client):
-    response = client.post(
+def test_create_request_for_missing_target(auth_client):
+    response = auth_client.post(
         "/api/v1/authorization-requests",
         json={
             "target_id": "00000000-0000-0000-0000-000000000000",
@@ -122,12 +160,12 @@ def test_create_request_for_missing_target(client):
 
 
 def test_get_authorization_request(
-    client,
+    auth_client,
     authorization_request,
 ):
     request_id = authorization_request["id"]
 
-    response = client.get(
+    response = auth_client.get(
         f"/api/v1/authorization-requests/{request_id}"
     )
 
@@ -136,10 +174,10 @@ def test_get_authorization_request(
 
 
 def test_list_authorization_requests(
-    client,
+    auth_client,
     authorization_request,
 ):
-    response = client.get(
+    response =auth_client.get(
         "/api/v1/authorization-requests"
     )
 
@@ -147,18 +185,21 @@ def test_list_authorization_requests(
     assert len(response.json()) == 1
 
 
+
 def test_approve_request_updates_target(
-    client,
+    auth_client,
     authorization_request,
     target_id,
+    reviewer_token,
 ):
+    token, reviewer_id = reviewer_token
     request_id = authorization_request["id"]
 
-    review_response = client.patch(
+    review_response = auth_client.patch(
         f"/api/v1/authorization-requests/{request_id}/review",
+        headers={"Authorization": f"Bearer {token}"},
         json={
             "status": "approved",
-            "reviewed_by": "local-test-reviewer",
             "review_reason": "Automated workflow test",
         },
     )
@@ -167,10 +208,10 @@ def test_approve_request_updates_target(
 
     reviewed = review_response.json()
     assert reviewed["status"] == "approved"
-    assert reviewed["reviewed_by"] == "local-test-reviewer"
+    assert reviewed["reviewed_by"] == reviewer_id
     assert reviewed["reviewed_at"] is not None
 
-    target_response = client.get(
+    target_response = auth_client.get(
         f"/api/v1/targets/{target_id}"
     )
 
@@ -178,57 +219,68 @@ def test_approve_request_updates_target(
     assert target_response.json()["authorization_status"] == "approved"
 
 
+
 def test_reject_request_updates_target(
-    client,
+   auth_client,
     authorization_request,
     target_id,
+    reviewer_token,
 ):
+    token, reviewer_id = reviewer_token
     request_id = authorization_request["id"]
 
-    review_response = client.patch(
+    review_response = auth_client.patch(
         f"/api/v1/authorization-requests/{request_id}/review",
+        headers={"Authorization": f"Bearer {token}"},
         json={
             "status": "rejected",
-            "reviewed_by": "local-test-reviewer",
             "review_reason": "Automated rejection test",
         },
     )
 
     assert review_response.status_code == 200
-    assert review_response.json()["status"] == "rejected"
 
-    target_response = client.get(
+    reviewed = review_response.json()
+    assert reviewed["status"] == "rejected"
+    assert reviewed["reviewed_by"] == reviewer_id
+
+    target_response = auth_client.get(
         f"/api/v1/targets/{target_id}"
     )
 
     assert target_response.json()["authorization_status"] == "rejected"
 
 
+
+
 def test_already_reviewed_request_cannot_be_reviewed_again(
-    client,
+    auth_client,
     authorization_request,
+    reviewer_token,
 ):
+    token, _ = reviewer_token
     request_id = authorization_request["id"]
     review_url = (
         f"/api/v1/authorization-requests/{request_id}/review"
     )
+    headers = {"Authorization": f"Bearer {token}"}
 
-    first_response = client.patch(
+    first_response = auth_client.patch(
         review_url,
+        headers=headers,
         json={
             "status": "approved",
-            "reviewed_by": "local-test-reviewer",
             "review_reason": "First review",
         },
     )
 
     assert first_response.status_code == 200
 
-    second_response = client.patch(
+    second_response = auth_client.patch(
         review_url,
+        headers=headers,
         json={
             "status": "rejected",
-            "reviewed_by": "local-test-reviewer",
             "review_reason": "Second review",
         },
     )

@@ -7,6 +7,8 @@ from sqlalchemy.pool import StaticPool
 from app.main import app
 from app.core.database import Base, get_db
 from app.models import Project, Target
+from app.core.security import create_access_token
+from app.models.user import User
 
 
 @pytest.fixture
@@ -42,6 +44,34 @@ def client():
     Base.metadata.drop_all(bind=test_engine)
     test_engine.dispose()
 
+@pytest.fixture
+def auth_client(client):
+    from app.core.database import get_db
+
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+
+    try:
+        user = User(
+            email="projects-reviewer@example.com",
+            password_hash="test-only-placeholder",
+            role="reviewer",
+            is_active=True,
+        )
+
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        token = create_access_token(user.id)
+    finally:
+        db_generator.close()
+
+    client.headers.update(
+        {"Authorization": f"Bearer {token}"}
+    )
+    return client
+
 
 def test_health_check(client):
     response = client.get("/api/v1/health")
@@ -50,15 +80,15 @@ def test_health_check(client):
     assert response.json()["status"] == "healthy"
 
 
-def test_list_projects_empty(client):
-    response = client.get("/api/v1/projects")
+def test_list_projects_empty(auth_client):
+    response = auth_client.get("/api/v1/projects")
 
     assert response.status_code == 200
     assert response.json() == []
 
 
-def test_create_and_retrieve_project(client):
-    create_response = client.post(
+def test_create_and_retrieve_project(auth_client):
+    create_response = auth_client.post(
         "/api/v1/projects",
         json={
             "name": "Automated Test Project",
@@ -74,30 +104,30 @@ def test_create_and_retrieve_project(client):
 
     project_id = project["id"]
 
-    get_response = client.get(f"/api/v1/projects/{project_id}")
+    get_response = auth_client.get(f"/api/v1/projects/{project_id}")
 
     assert get_response.status_code == 200
     assert get_response.json()["id"] == project_id
 
 
-def test_get_nonexistent_project(client):
-    response = client.get(
+def test_get_nonexistent_project(auth_client):
+    response = auth_client.get(
         "/api/v1/projects/00000000-0000-0000-0000-000000000000"
     )
 
     assert response.status_code == 404
 
 
-def test_create_project_without_name(client):
-    response = client.post(
+def test_create_project_without_name(auth_client):
+    response = auth_client.post(
         "/api/v1/projects",
         json={"description": "Missing project name"},
     )
 
     assert response.status_code == 422
     
-def test_update_project(client):
-    create_response = client.post(
+def test_update_project(auth_client):
+    create_response = auth_client.post(
         "/api/v1/projects",
         json={
             "name": "Original Project",
@@ -108,7 +138,7 @@ def test_update_project(client):
     assert create_response.status_code == 201
     project_id = create_response.json()["id"]
 
-    update_response = client.patch(
+    update_response = auth_client.patch(
         f"/api/v1/projects/{project_id}",
         json={
             "name": "Updated Project",
@@ -121,8 +151,8 @@ def test_update_project(client):
     assert update_response.json()["description"] == "After update"
 
 
-def test_delete_project(client):
-    create_response = client.post(
+def test_delete_project(auth_client):
+    create_response = auth_client.post(
         "/api/v1/projects",
         json={
             "name": "Project To Delete",
@@ -133,13 +163,13 @@ def test_delete_project(client):
     assert create_response.status_code == 201
     project_id = create_response.json()["id"]
 
-    delete_response = client.delete(
+    delete_response = auth_client.delete(
         f"/api/v1/projects/{project_id}"
     )
 
     assert delete_response.status_code == 204
 
-    get_response = client.get(
+    get_response = auth_client.get(
         f"/api/v1/projects/{project_id}"
     )
 

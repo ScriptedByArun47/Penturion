@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     database_url: str = f"sqlite:///{(PROJECT_ROOT / 'data' / 'penturion.db').as_posix()}"
     data_dir: Path = PROJECT_ROOT / "data"
     log_level: str = "INFO"
+    jwt_secret_key: str
+    access_token_expire_minutes: int = 15
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

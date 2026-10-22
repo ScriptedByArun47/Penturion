@@ -74,6 +74,7 @@ def review_authorization_request(
     db: Session,
     request_id: str,
     review_data: AuthorizationReview,
+    reviewed_by: str,
 ) -> AuthorizationRequest | None:
     request = db.get(AuthorizationRequest, request_id)
 
@@ -92,7 +93,7 @@ def review_authorization_request(
 
     try:
         request.status = review_data.status
-        request.reviewed_by = review_data.reviewed_by
+        request.reviewed_by = reviewed_by
         request.review_reason = review_data.review_reason
         request.reviewed_at = utc_now()
 

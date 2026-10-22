@@ -43,28 +43,27 @@ class AuthorizationRequestCreate(BaseModel):
         return value
 
 
-class AuthorizationReview(BaseModel):
-    status: Literal["approved", "rejected"]
 
-    reviewed_by: str = Field(
-        min_length=1,
-        max_length=100,
-    )
+class AuthorizationReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["approved", "rejected"]
 
     review_reason: str = Field(
         min_length=1,
         max_length=5000,
     )
 
-    @field_validator("reviewed_by", "review_reason")
+    @field_validator("review_reason")
     @classmethod
-    def validate_non_empty_strings(cls, value: str) -> str:
+    def validate_non_empty_string(cls, value: str) -> str:
         value = value.strip()
 
         if not value:
             raise ValueError("This field cannot be empty")
 
         return value
+
 
 
 class AuthorizationRequestResponse(BaseModel):

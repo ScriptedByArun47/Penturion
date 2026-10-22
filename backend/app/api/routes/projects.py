@@ -8,9 +8,13 @@ from app.schemas.project import (
     ProjectUpdate,
 )
 from app.services import project_service
+from app.api.dependencies import get_current_user
 
-router = APIRouter(prefix="/projects", tags=["Projects"])
-
+router = APIRouter(
+    prefix="/projects",
+    tags=["Projects"],
+    dependencies=[Depends(get_current_user)],
+)
 
 @router.post(
     "",
