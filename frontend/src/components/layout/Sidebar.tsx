@@ -7,16 +7,19 @@ import {
   Bug,
   FileText,
   Settings,
+  ShieldCheck,
 } from "lucide-react";
 
 const items = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
   { to: "/projects", label: "Projects", icon: FolderKanban },
   { to: "/targets", label: "Targets", icon: Crosshair },
+  { to: "/authorization", label: "Authorization", icon: ShieldCheck },
   { to: "/scans", label: "Scans", icon: ScanSearch },
   { to: "/findings", label: "Findings", icon: Bug },
   { to: "/reports", label: "Reports", icon: FileText },
   { to: "/settings", label: "Settings", icon: Settings },
+  
 ];
 
 export default function Sidebar() {

@@ -75,3 +75,5 @@ a { color: var(--accent); }
 select { background: var(--bg); border: 1px solid var(--line); color: var(--text); padding: 5px 8px; border-radius: 6px; }
 .badge-active { background: #14532d; } .badge-inactive { background: #334155; } .badge-archived { background: #3f3f46; }
 .badge-approved { background: #14532d; } .badge-pending { background: #713f12; } .badge-rejected { background: #7f1d1d; }
+
+.sample { opacity: 0.7; }

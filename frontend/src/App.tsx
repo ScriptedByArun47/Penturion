@@ -6,6 +6,7 @@ import Register from "./pages/Register";
 import Overview from "./pages/Overview";
 import Projects from "./pages/Projects";
 import Targets from "./pages/Targets";
+import Authorization from "./pages/Authorization";
 import Scans from "./pages/Scans";
 import Findings from "./pages/Findings";
 import Reports from "./pages/Reports";
@@ -22,6 +23,7 @@ export default function App() {
           <Route index element={<Overview />} />
           <Route path="projects" element={<Projects />} />
           <Route path="targets" element={<Targets />} />
+          <Route path="authorization" element={<Authorization />} />
           <Route path="scans" element={<Scans />} />
           <Route path="findings" element={<Findings />} />
           <Route path="reports" element={<Reports />} />

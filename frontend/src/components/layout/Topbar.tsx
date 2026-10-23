@@ -2,6 +2,14 @@ import { useLocation } from "react-router-dom";
 import { LogOut } from "lucide-react";
 import { useAuth } from "../../auth/AuthContext";
 
+// Pages that still show sample data. Pages not listed here use the real backend.
+const sampleLabels: Record<string, string> = {
+  "/": "Partly sample data",
+  "/scans": "Sample data",
+  "/findings": "Sample data",
+  "/reports": "Sample data",
+};
+
 export default function Topbar() {
   const { pathname } = useLocation();
   const { user, logout } = useAuth();
@@ -14,7 +22,7 @@ export default function Topbar() {
     <header className="topbar">
       <h1>{title}</h1>
       <div className="topbar-right">
-        <span className="pill">Mock data</span>
+        {sampleLabels[pathname] && <span className="pill">{sampleLabels[pathname]}</span>}
         {user && (
           <>
             <span className="user-info">
