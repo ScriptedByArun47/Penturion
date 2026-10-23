@@ -2,17 +2,18 @@
 import type { Finding, Project, Report, Scan, Severity, Target } from "../types";
 
 export const projects: Project[] = [
-  { id: "PRJ-001", name: "Internal Web Apps", owner: "Alex", targets: 5, created: "2026-09-01" },
-  { id: "PRJ-002", name: "Customer Portal", owner: "Sam", targets: 4, created: "2026-09-14" },
-  { id: "PRJ-003", name: "Lab Network", owner: "Alex", targets: 3, created: "2026-10-02" },
+  { id: "prj-001", name: "Internal Web Apps", description: "Quarterly assessment of internal tools", status: "active", created_at: "2026-09-01T09:00:00Z", updated_at: "2026-09-01T09:00:00Z" },
+  { id: "prj-002", name: "Customer Portal", description: null, status: "active", created_at: "2026-09-14T09:00:00Z", updated_at: "2026-09-14T09:00:00Z" },
+  { id: "prj-003", name: "Lab Network", description: "Practice environment", status: "archived", created_at: "2026-10-02T09:00:00Z", updated_at: "2026-10-02T09:00:00Z" },
 ];
 
 export const targets: Target[] = [
-  { id: "TGT-001", host: "demo.example.com", project: "Internal Web Apps", type: "Web" },
-  { id: "TGT-002", host: "staging.example.com", project: "Customer Portal", type: "Web" },
-  { id: "TGT-003", host: "10.0.0.15", project: "Lab Network", type: "Host" },
+  { id: "tgt-001", project_id: "prj-001", value: "demo.example.com", target_type: "domain", authorization_status: "approved", notes: null, created_at: "2026-09-02T09:00:00Z" },
+  { id: "tgt-002", project_id: "prj-002", value: "staging.example.com", target_type: "domain", authorization_status: "pending", notes: "Awaiting written approval", created_at: "2026-09-15T09:00:00Z" },
+  { id: "tgt-003", project_id: "prj-003", value: "10.0.0.15", target_type: "ip", authorization_status: "rejected", notes: null, created_at: "2026-10-03T09:00:00Z" },
 ];
 
+// Scans, findings and reports have no backend yet, so they stay mock-only.
 export const scans: Scan[] = [
   { id: "SCAN-001", target: "demo.example.com", status: "Completed", findings: 5, started: "2026-10-18 09:00", ended: "2026-10-18 09:42" },
   { id: "SCAN-002", target: "staging.example.com", status: "Running", findings: 2, started: "2026-10-18 10:10" },
