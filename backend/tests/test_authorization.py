@@ -79,6 +79,36 @@ def reviewer_token(client):
         db_generator.close()
 
 
+@pytest.fixture
+def second_auth_client(client):
+    from app.core.database import get_db
+
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+
+    try:
+        user = User(
+            email="seconduser@example.com",
+            password_hash="test-only-not-a-real-password-hash",
+            role="user",
+            is_active=True,
+        )
+
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        token = create_access_token(user.id)
+        user_id = user.id
+    finally:
+        db_generator.close()
+
+    client.headers.update({
+        "Authorization": f"Bearer {token}"
+    })
+
+    return client, user_id
+
 
 @pytest.fixture
 def target_id(auth_client):
@@ -286,3 +316,57 @@ def test_already_reviewed_request_cannot_be_reviewed_again(
     )
 
     assert second_response.status_code == 409
+    
+    
+def test_requester_identity_cannot_be_spoofed(
+    auth_client,
+    target_id,
+):
+    response = auth_client.post(
+        "/api/v1/authorization-requests",
+        json={
+            "target_id": target_id,
+            "evidence_reference": "identity-test",
+            "requested_scope": "example.com web testing",
+            "requested_by": "victim@example.com",
+        },
+    )
+
+    assert response.status_code == 201
+
+    # The authenticated user's identity must be used,
+    # not the identity submitted in the request body.
+    assert response.json()["requested_by"] == "reviewer@example.com"
+
+
+def test_user_cannot_list_another_users_requests(
+    auth_client,
+    authorization_request,
+    second_auth_client,
+):
+    second_client, _ = second_auth_client
+
+    response = second_client.get(
+        "/api/v1/authorization-requests"
+    )
+
+    assert response.status_code == 200
+    assert all(
+        item["id"] != authorization_request["id"]
+        for item in response.json()
+    )
+
+
+def test_user_cannot_get_another_users_request(
+    auth_client,
+    authorization_request,
+    second_auth_client,
+):
+    second_client, _ = second_auth_client
+
+    response = second_client.get(
+        f"/api/v1/authorization-requests/"
+        f"{authorization_request['id']}"
+    )
+
+    assert response.status_code == 404

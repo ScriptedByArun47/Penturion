@@ -72,6 +72,35 @@ def auth_client(client):
     )
     return client
 
+@pytest.fixture
+def second_auth_client(client):
+    from app.core.database import get_db
+
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+
+    try:
+        user = User(
+            email="second-user@example.com",
+            password_hash="test-only-placeholder",
+            role="user",
+            is_active=True,
+        )
+
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        token = create_access_token(user.id)
+    finally:
+        db_generator.close()
+
+    second_client = TestClient(app)
+    second_client.headers.update(
+        {"Authorization": f"Bearer {token}"}
+    )
+    return second_client
+
 
 def test_health_check(client):
     response = client.get("/api/v1/health")
@@ -174,3 +203,80 @@ def test_delete_project(auth_client):
     )
 
     assert get_response.status_code == 404
+
+def test_user_cannot_view_another_users_project(auth_client, second_auth_client):
+    create_response = auth_client.post(
+        "/api/v1/projects",
+        json={"name": "Private Project"},
+    )
+    assert create_response.status_code == 201
+    project_id = create_response.json()["id"]
+
+    response = second_auth_client.get(
+        f"/api/v1/projects/{project_id}"
+    )
+    assert response.status_code == 404
+
+
+def test_user_cannot_update_another_users_project(auth_client, second_auth_client):
+    create_response = auth_client.post(
+        "/api/v1/projects",
+        json={"name": "Private Project"},
+    )
+    assert create_response.status_code == 201
+    project_id = create_response.json()["id"]
+
+    response = second_auth_client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"name": "Unauthorized Update"},
+    )
+    assert response.status_code == 404
+
+    owner_response = auth_client.get(
+        f"/api/v1/projects/{project_id}"
+    )
+    assert owner_response.status_code == 200
+    assert owner_response.json()["name"] == "Private Project"
+
+
+def test_user_cannot_delete_another_users_project(auth_client, second_auth_client):
+    create_response = auth_client.post(
+        "/api/v1/projects",
+        json={"name": "Private Project"},
+    )
+    assert create_response.status_code == 201
+    project_id = create_response.json()["id"]
+
+    response = second_auth_client.delete(
+        f"/api/v1/projects/{project_id}"
+    )
+    assert response.status_code == 404
+
+    owner_response = auth_client.get(
+        f"/api/v1/projects/{project_id}"
+    )
+    assert owner_response.status_code == 200
+
+
+def test_user_lists_only_their_own_projects(auth_client, second_auth_client):
+    auth_client.post(
+        "/api/v1/projects",
+        json={"name": "User One Project"},
+    )
+    second_auth_client.post(
+        "/api/v1/projects",
+        json={"name": "User Two Project"},
+    )
+
+    first_projects = auth_client.get("/api/v1/projects")
+    second_projects = second_auth_client.get("/api/v1/projects")
+
+    assert first_projects.status_code == 200
+    assert second_projects.status_code == 200
+
+    assert [p["name"] for p in first_projects.json()] == [
+        "User One Project"
+    ]
+    assert [p["name"] for p in second_projects.json()] == [
+        "User Two Project"
+    ]

@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import get_current_user
 from app.core.database import get_db
+from app.models.user import User
 from app.schemas.target import TargetCreate, TargetUpdate, TargetResponse
 from app.services import target_service
-from app.api.dependencies import get_current_user
 
 
 router = APIRouter(
@@ -22,12 +23,14 @@ def create_project_target(
     project_id: str,
     target_data: TargetCreate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     try:
         return target_service.create_target(
             db=db,
             project_id=project_id,
             target_data=target_data,
+            owner_id=current_user.id,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -43,11 +46,13 @@ def create_project_target(
 def list_project_targets(
     project_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     try:
         return target_service.list_project_targets(
             db=db,
             project_id=project_id,
+            owner_id=current_user.id,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -63,10 +68,12 @@ def list_project_targets(
 def get_target(
     target_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     target = target_service.get_target(
         db=db,
         target_id=target_id,
+        owner_id=current_user.id,
     )
 
     if target is None:
@@ -86,11 +93,13 @@ def update_target(
     target_id: str,
     target_data: TargetUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     target = target_service.update_target(
         db=db,
         target_id=target_id,
         target_data=target_data,
+        owner_id=current_user.id,
     )
 
     if target is None:
@@ -109,10 +118,12 @@ def update_target(
 def delete_target(
     target_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     deleted = target_service.delete_target(
         db=db,
         target_id=target_id,
+        owner_id=current_user.id,
     )
 
     if not deleted:

@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.authorization import AuthorizationRequest
+from app.models.project import Project
 from app.models.target import Target
 from app.schemas.authorization import (
     AuthorizationRequestCreate,
@@ -20,8 +21,18 @@ def utc_now() -> datetime:
 def create_authorization_request(
     db: Session,
     request_data: AuthorizationRequestCreate,
+    requester_email: str,
+    owner_id: str,
 ) -> AuthorizationRequest:
-    target = db.get(Target, request_data.target_id)
+    # Only the owner of the target's project may request authorization.
+    target = db.scalars(
+        select(Target)
+        .join(Project, Target.project_id == Project.id)
+        .where(
+            Target.id == request_data.target_id,
+            Project.owner_id == owner_id,
+        )
+    ).first()
 
     if target is None:
         raise ValueError("Target not found")
@@ -30,7 +41,7 @@ def create_authorization_request(
         target_id=target.id,
         evidence_reference=request_data.evidence_reference,
         requested_scope=request_data.requested_scope,
-        requested_by=request_data.requested_by,
+        requested_by=requester_email,
         status="pending",
     )
 
@@ -48,15 +59,32 @@ def create_authorization_request(
 def get_authorization_request(
     db: Session,
     request_id: str,
+    owner_id: str,
 ) -> AuthorizationRequest | None:
-    return db.get(AuthorizationRequest, request_id)
+    statement = (
+        select(AuthorizationRequest)
+        .join(Target, AuthorizationRequest.target_id == Target.id)
+        .join(Project, Target.project_id == Project.id)
+        .where(
+            AuthorizationRequest.id == request_id,
+            Project.owner_id == owner_id,
+        )
+    )
+
+    return db.scalars(statement).first()
 
 
 def list_authorization_requests(
     db: Session,
+    owner_id: str,
     target_id: str | None = None,
 ) -> list[AuthorizationRequest]:
-    statement = select(AuthorizationRequest)
+    statement = (
+        select(AuthorizationRequest)
+        .join(Target, AuthorizationRequest.target_id == Target.id)
+        .join(Project, Target.project_id == Project.id)
+        .where(Project.owner_id == owner_id)
+    )
 
     if target_id is not None:
         statement = statement.where(

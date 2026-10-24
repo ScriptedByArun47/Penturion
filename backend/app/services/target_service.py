@@ -10,14 +10,19 @@ def create_target(
     db: Session,
     project_id: str,
     target_data: TargetCreate,
+    owner_id: str,
 ) -> Target:
-    # Verify that the parent project exists.
-    project = db.get(Project, project_id)
+    # Only the project owner can create targets.
+    project = db.scalars(
+        select(Project).where(
+            Project.id == project_id,
+            Project.owner_id == owner_id,
+        )
+    ).first()
 
     if project is None:
         raise ValueError("Project not found")
 
-    # New targets must remain pending authorization.
     target = Target(
         project_id=project_id,
         value=target_data.value,
@@ -36,8 +41,15 @@ def create_target(
 def list_project_targets(
     db: Session,
     project_id: str,
+    owner_id: str,
 ) -> list[Target]:
-    project = db.get(Project, project_id)
+    # Verify ownership before listing targets.
+    project = db.scalars(
+        select(Project).where(
+            Project.id == project_id,
+            Project.owner_id == owner_id,
+        )
+    ).first()
 
     if project is None:
         raise ValueError("Project not found")
@@ -54,16 +66,27 @@ def list_project_targets(
 def get_target(
     db: Session,
     target_id: str,
+    owner_id: str,
 ) -> Target | None:
-    return db.get(Target, target_id)
+    statement = (
+        select(Target)
+        .join(Project, Target.project_id == Project.id)
+        .where(
+            Target.id == target_id,
+            Project.owner_id == owner_id,
+        )
+    )
+
+    return db.scalars(statement).first()
 
 
 def update_target(
     db: Session,
     target_id: str,
     target_data: TargetUpdate,
+    owner_id: str,
 ) -> Target | None:
-    target = db.get(Target, target_id)
+    target = get_target(db, target_id, owner_id)
 
     if target is None:
         return None
@@ -86,8 +109,9 @@ def update_target(
 def delete_target(
     db: Session,
     target_id: str,
+    owner_id: str,
 ) -> bool:
-    target = db.get(Target, target_id)
+    target = get_target(db, target_id, owner_id)
 
     if target is None:
         return False

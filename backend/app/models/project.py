@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, String, Text
+from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -18,6 +18,13 @@ class Project(Base):
         String(36),
         primary_key=True,
         default=lambda: str(uuid4()),
+    )
+    
+    owner_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
     )
 
     name: Mapped[str] = mapped_column(String(150), nullable=False)
@@ -45,3 +52,4 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+    owner: Mapped["User | None"] = relationship()

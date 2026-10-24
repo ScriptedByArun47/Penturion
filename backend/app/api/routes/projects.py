@@ -1,14 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
-from app.schemas.project import (
-    ProjectCreate,
-    ProjectResponse,
-    ProjectUpdate,
-)
-from app.services import project_service
 from app.api.dependencies import get_current_user
+from app.core.database import get_db
+from app.models.user import User
+from app.schemas.project import ProjectCreate, ProjectResponse, ProjectUpdate
+from app.services import project_service
 
 router = APIRouter(
     prefix="/projects",
@@ -16,17 +13,17 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
-@router.post(
-    "",
-    response_model=ProjectResponse,
-    status_code=status.HTTP_201_CREATED,
-)
+
+@router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 def create_project(
     data: ProjectCreate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     try:
-        return project_service.create_project(db, data)
+        return project_service.create_project(
+            db, data, owner_id=current_user.id
+        )
     except ValueError as exc:
         db.rollback()
         raise HTTPException(
@@ -36,16 +33,22 @@ def create_project(
 
 
 @router.get("", response_model=list[ProjectResponse])
-def list_projects(db: Session = Depends(get_db)):
-    return project_service.list_projects(db)
+def list_projects(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return project_service.list_projects(db, owner_id=current_user.id)
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
 def get_project(
     project_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    project = project_service.get_project(db, project_id)
+    project = project_service.get_project(
+        db, project_id, owner_id=current_user.id
+    )
 
     if project is None:
         raise HTTPException(
@@ -61,8 +64,11 @@ def update_project(
     project_id: str,
     data: ProjectUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    project = project_service.get_project(db, project_id)
+    project = project_service.get_project(
+        db, project_id, owner_id=current_user.id
+    )
 
     if project is None:
         raise HTTPException(
@@ -84,8 +90,11 @@ def update_project(
 def delete_project(
     project_id: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    project = project_service.get_project(db, project_id)
+    project = project_service.get_project(
+        db, project_id, owner_id=current_user.id
+    )
 
     if project is None:
         raise HTTPException(
