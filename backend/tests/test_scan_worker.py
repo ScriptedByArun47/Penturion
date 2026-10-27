@@ -3,7 +3,7 @@ from app.models.scan import Scan
 from app.models.target import Target
 from app.services.scan_service import process_next_scan
 from unittest.mock import patch
-
+import pytest
 from app.services.scan_service import ScanAuthorizationError
 
 from datetime import datetime, timedelta, timezone
@@ -18,10 +18,10 @@ from tests.test_scan_lifecycle import (
 from app.services.scan_service import (
     ScanLifecycleError,
     claim_next_scan,
+    complete_running_scan,
     fail_running_scan,
     update_scan_heartbeat,
 )
-
 
 def test_worker_validates_authorized_scan_without_execution(
     auth_client, target_id
@@ -443,6 +443,148 @@ def test_expired_lease_is_recovered_even_with_recent_heartbeat(
         assert scan.status == "failed"
         assert scan.worker_id is None
         assert scan.lease_expires_at is None
+
+    finally:
+        db_generator.close()
+        
+def test_worker_cannot_fail_scan_after_lease_expires(
+    auth_client, target_id
+):
+    create_queued_scan(auth_client, target_id)
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        scan = claim_next_scan(db, worker_id="worker-A")
+        assert scan is not None
+        assert scan.status == "running"
+
+        # Simulate an expired lease.
+        scan.lease_expires_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        )
+        db.commit()
+
+        with pytest.raises(ScanLifecycleError):
+            fail_running_scan(
+                db=db,
+                scan_id=scan.id,
+                error_message="Test failure",
+                worker_id="worker-A",
+            )
+
+        db.refresh(scan)
+        assert scan.status == "running"
+        assert scan.worker_id == "worker-A"
+
+    finally:
+        db_generator.close()
+def test_only_one_worker_can_claim_a_queued_scan(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        first_claim = claim_next_scan(
+            db,
+            worker_id="worker-A",
+        )
+
+        assert first_claim is not None
+        assert first_claim.id == scan_id
+        assert first_claim.status == "running"
+        assert first_claim.worker_id == "worker-A"
+
+        second_claim = claim_next_scan(
+            db,
+            worker_id="worker-B",
+        )
+
+        assert second_claim is None
+
+        db.expire_all()
+        stored_scan = db.get(Scan, scan_id)
+
+        assert stored_scan is not None
+        assert stored_scan.status == "running"
+        assert stored_scan.worker_id == "worker-A"
+
+    finally:
+        db_generator.close()
+def test_worker_can_complete_scan_with_valid_lease(
+    auth_client, target_id
+):
+    create_queued_scan(auth_client, target_id)
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        scan = claim_next_scan(db, worker_id="worker-A")
+        assert scan is not None
+
+        completed = complete_running_scan(
+            db,
+            scan.id,
+            worker_id="worker-A",
+        )
+
+        assert completed.status == "completed"
+        assert completed.completed_at is not None
+        assert completed.worker_id is None
+        assert completed.lease_expires_at is None
+
+    finally:
+        db_generator.close()
+        
+def test_worker_cannot_complete_another_workers_scan(
+    auth_client, target_id
+):
+    create_queued_scan(auth_client, target_id)
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        scan = claim_next_scan(db, worker_id="worker-A")
+        assert scan is not None
+
+        with pytest.raises(ScanLifecycleError):
+            complete_running_scan(
+                db,
+                scan.id,
+                worker_id="worker-B",
+            )
+
+        db.refresh(scan)
+        assert scan.status == "running"
+        assert scan.worker_id == "worker-A"
+
+    finally:
+        db_generator.close()
+    
+def test_worker_cannot_complete_scan_after_lease_expires(
+    auth_client, target_id
+):
+    create_queued_scan(auth_client, target_id)
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        scan = claim_next_scan(db, worker_id="worker-A")
+        assert scan is not None
+
+        scan.lease_expires_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        )
+        db.commit()
+
+        with pytest.raises(ScanLifecycleError):
+            complete_running_scan(
+                db,
+                scan.id,
+                worker_id="worker-A",
+            )
+
+        db.refresh(scan)
+        assert scan.status == "running"
+        assert scan.worker_id == "worker-A"
 
     finally:
         db_generator.close()

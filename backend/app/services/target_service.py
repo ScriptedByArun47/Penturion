@@ -80,6 +80,7 @@ def get_target(
     return db.scalars(statement).first()
 
 
+
 def update_target(
     db: Session,
     target_id: str,
@@ -93,6 +94,15 @@ def update_target(
 
     updates = target_data.model_dump(exclude_unset=True)
 
+    # A changed target must be authorized again.
+    target_value_changed = (
+        "value" in updates
+        and updates["value"] != target.value
+    )
+
+    if target_value_changed:
+        target.authorization_status = "pending"
+
     for field, value in updates.items():
         setattr(target, field, value)
 
@@ -104,6 +114,7 @@ def update_target(
         raise
 
     return target
+
 
 
 def delete_target(

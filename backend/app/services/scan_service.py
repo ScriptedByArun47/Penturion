@@ -430,7 +430,58 @@ def fail_running_scan(
         db.rollback()
         raise
 
+def complete_running_scan(
+    db: Session,
+    scan_id: str,
+    worker_id: str,
+) -> Scan:
+    """Complete a running scan only if the worker owns a valid lease."""
 
+    if not worker_id.strip() or len(worker_id) > 100:
+        raise ValueError("worker_id must contain 1-100 characters")
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        result = db.execute(
+            update(Scan)
+            .where(
+                Scan.id == scan_id,
+                Scan.status == "running",
+                Scan.worker_id == worker_id,
+                Scan.lease_expires_at > now,
+            )
+            .values(
+                status="completed",
+                completed_at=now,
+                error_message=None,
+                worker_id=None,
+                lease_expires_at=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+        if result.rowcount != 1:
+            raise ScanLifecycleError(
+                "Could not complete scan: worker ownership or lease is invalid"
+            )
+
+        db.commit()
+        db.expire_all()
+
+        scan = db.get(Scan, scan_id)
+
+        if scan is None:
+            raise ScanLifecycleError(
+                "Scan could not be retrieved after completion"
+            )
+
+        return scan
+
+    except Exception:
+        db.rollback()
+        raise
+    
 def recover_abandoned_scans(
     db: Session,
     timeout_minutes: int = 30,

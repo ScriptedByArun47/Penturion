@@ -344,3 +344,61 @@ def test_approved_target_creates_queued_scan(
         assert scan.requested_by == target.project.owner_id
     finally:
         db_generator.close()
+
+
+def test_changing_approved_target_resets_authorization(
+    auth_client,
+    target_id,
+):
+    from app.core.database import get_db
+    from app.models.target import Target
+
+    db_generator = auth_client.app.dependency_overrides[get_db]()
+    db = next(db_generator)
+
+    try:
+        target = db.get(Target, target_id)
+        assert target is not None
+
+        target.authorization_status = "approved"
+        db.commit()
+    finally:
+        db_generator.close()
+
+    response = auth_client.patch(
+        f"/api/v1/targets/{target_id}",
+        json={"value": "another-domain.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["value"] == "another-domain.com"
+    assert response.json()["authorization_status"] == "pending"
+
+
+def test_updating_notes_preserves_target_authorization(
+    auth_client,
+    target_id,
+):
+    from app.core.database import get_db
+    from app.models.target import Target
+
+    db_generator = auth_client.app.dependency_overrides[get_db]()
+    db = next(db_generator)
+
+    try:
+        target = db.get(Target, target_id)
+        assert target is not None
+
+        target.authorization_status = "approved"
+        db.commit()
+    finally:
+        db_generator.close()
+
+    response = auth_client.patch(
+        f"/api/v1/targets/{target_id}",
+        json={"notes": "Updated notes"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["authorization_status"] == "approved"
+    assert response.json()["notes"] == "Updated notes"
