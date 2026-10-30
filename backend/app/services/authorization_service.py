@@ -12,6 +12,9 @@ from app.schemas.authorization import (
     AuthorizationRequestCreate,
     AuthorizationReview,
 )
+from app.services.authorization_scope import (
+    validate_authorization_scope,
+)
 
 
 def utc_now() -> datetime:
@@ -37,10 +40,16 @@ def create_authorization_request(
     if target is None:
         raise ValueError("Target not found")
 
+    validated_scope = validate_authorization_scope(
+        requested_scope=request_data.requested_scope,
+        target_value=target.value,
+        target_type=target.target_type,
+    )
+     
     request = AuthorizationRequest(
         target_id=target.id,
         evidence_reference=request_data.evidence_reference,
-        requested_scope=request_data.requested_scope,
+        requested_scope=validated_scope,
         requested_by=requester_email,
         status="pending",
     )

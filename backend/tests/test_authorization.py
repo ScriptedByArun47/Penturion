@@ -144,7 +144,7 @@ def authorization_request(auth_client, target_id):
         json={
             "target_id": target_id,
             "evidence_reference": "test-evidence-001",
-            "requested_scope": "example.com web testing",
+            "requested_scope": '["example.com"]',
             "requested_by": "test-requester",
         },
     )
@@ -162,7 +162,7 @@ def test_create_authorization_request(
         json={
             "target_id": target_id,
             "evidence_reference": "test-evidence-002",
-            "requested_scope": "example.com web testing",
+            "requested_scope": '["example.com"]',
             "requested_by": "test-requester",
         },
     )
@@ -327,7 +327,7 @@ def test_requester_identity_cannot_be_spoofed(
         json={
             "target_id": target_id,
             "evidence_reference": "identity-test",
-            "requested_scope": "example.com web testing",
+            "requested_scope": '["example.com"]',
             "requested_by": "victim@example.com",
         },
     )

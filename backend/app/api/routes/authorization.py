@@ -11,6 +11,7 @@ from app.schemas.authorization import (
     AuthorizationRequestResponse,
     AuthorizationReview,
 )
+from app.services.authorization_scope import AuthorizationScopeError
 from app.services import authorization_service
 
 router = APIRouter(
@@ -37,6 +38,11 @@ def create_request(
             requester_email=current_user.email,
             owner_id=current_user.id,
         )
+    except AuthorizationScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
