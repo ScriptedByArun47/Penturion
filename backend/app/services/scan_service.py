@@ -12,6 +12,21 @@ from app.models.project import Project
 from app.models.scan import Scan
 from app.models.target import Target
 
+import ipaddress
+import json
+
+from app.models.authorization import AuthorizationRequest
+from app.scanners.scope import (
+    ScopeValidationError,
+    host_matches_domain,
+    normalize_hostname,
+    validate_target_in_scope,
+)
+from app.services.authorization_scope import (
+    AuthorizationScopeError,
+    validate_authorization_scope,
+)
+
 
 ALLOWED_SCAN_TRANSITIONS = {
     "queued": {"running", "failed"},
@@ -26,11 +41,82 @@ class ScanLifecycleError(Exception):
 class ScanAuthorizationError(Exception):
     """Raised when a scan request is not authorized."""
 
+def validate_approved_scope(
+    request: AuthorizationRequest,
+    target: Target,
+) -> None:
+    """Verify that an approved request's scope covers the actual target."""
+
+    if request.status != "approved":
+        raise ScanAuthorizationError(
+            "The authorization request is not approved"
+        )
+
+    if request.target_id != target.id:
+        raise ScanAuthorizationError(
+            "Authorization request does not belong to this target"
+        )
+
+    try:
+        canonical_scope = validate_authorization_scope(
+            requested_scope=request.requested_scope,
+            target_value=target.value,
+            target_type=target.target_type,
+        )
+        entries = json.loads(canonical_scope)
+
+        if target.target_type == "domain":
+            target_hostname = normalize_hostname(target.value)
+
+            covered = any(
+                host_matches_domain(target_hostname, entry)
+                for entry in entries
+            )
+
+        elif target.target_type == "ip":
+            target_ip = ipaddress.ip_address(target.value)
+
+            covered = any(
+                ipaddress.ip_address(entry) == target_ip
+                for entry in entries
+            )
+
+        elif target.target_type == "url":
+            covered = False
+
+            for entry in entries:
+                try:
+                    validate_target_in_scope(
+                        target.value,
+                        entry,
+                        "url",
+                    )
+                    covered = True
+                    break
+                except ScopeValidationError:
+                    continue
+
+        else:
+            raise ScanAuthorizationError(
+                "Unsupported target type"
+            )
+
+    except (AuthorizationScopeError, ScopeValidationError, ValueError) as exc:
+        raise ScanAuthorizationError(
+            "Authorization scope validation failed"
+        ) from exc
+
+    if not covered:
+        raise ScanAuthorizationError(
+            "The approved scope does not cover the scan target"
+        )
+
 
 def validate_scan_authorization(
     db: Session,
     target_id: str,
     owner_id: str,
+    authorization_request_id: str,
 ) -> Target:
     """Verify target ownership and authorization before scanning."""
 
@@ -55,8 +141,24 @@ def validate_scan_authorization(
             "Target authorization must be approved before scanning"
         )
 
-    return target
+    authorization_request = db.scalars(
+        select(AuthorizationRequest).where(
+            AuthorizationRequest.id == authorization_request_id,
+            AuthorizationRequest.target_id == target.id,
+        )
+    ).first()
 
+    if authorization_request is None:
+        raise ScanAuthorizationError(
+            "Authorization request not found for this target"
+        )
+
+    validate_approved_scope(
+        request=authorization_request,
+        target=target,
+    )
+
+    return target
 
 def validate_scan_for_execution(
     db: Session,
@@ -66,6 +168,7 @@ def validate_scan_for_execution(
 
     Returns None if the scan does not exist.
     Raises ScanAuthorizationError if authorization is no longer valid.
+    Scanner network execution remains disabled.
     """
 
     statement = (
@@ -85,20 +188,57 @@ def validate_scan_for_execution(
             "Only running scans can be validated for execution"
         )
 
+    # Verify that the requester matches the scan's recorded requester.
     if scan.requested_by != scan.requester.id:
         raise ScanAuthorizationError(
             "Scan requester does not match the scan owner"
         )
 
+    # Verify that the target still belongs to the requesting user.
     if scan.target.project.owner_id != scan.requested_by:
         raise ScanAuthorizationError(
             "Target ownership has changed; execution denied"
+        )
+
+    # Require a specific authorization request for this scan.
+    if scan.authorization_request_id is None:
+        raise ScanAuthorizationError(
+            "Scan has no associated authorization request"
+        )
+
+    authorization_request = db.scalars(
+        select(AuthorizationRequest).where(
+            AuthorizationRequest.id == scan.authorization_request_id,
+            AuthorizationRequest.target_id == scan.target_id,
+        )
+    ).first()
+
+    if authorization_request is None:
+        raise ScanAuthorizationError(
+            "Authorization request is no longer valid"
+        )
+
+    # Both the request and target must remain approved.
+    if authorization_request.status != "approved":
+        raise ScanAuthorizationError(
+            "Target authorization is no longer approved"
         )
 
     if scan.target.authorization_status != "approved":
         raise ScanAuthorizationError(
             "Target authorization is no longer approved"
         )
+
+    # Revalidate the approved scope against the current target.
+    try:
+        validate_approved_scope(
+            request=authorization_request,
+            target=scan.target,
+        )
+    except ScanAuthorizationError as exc:
+        raise ScanAuthorizationError(
+            "Target authorization is no longer valid for execution"
+        ) from exc
 
     return scan
 
@@ -108,6 +248,7 @@ def create_scan(
     db: Session,
     target_id: str,
     owner_id: str,
+    authorization_request_id: str,
     scan_type: str = "web",
 ) -> Scan:
     """Create a queued scan only for an authorized target."""
@@ -122,10 +263,12 @@ def create_scan(
         db=db,
         target_id=target_id,
         owner_id=owner_id,
+        authorization_request_id=authorization_request_id,
     )
 
     scan = Scan(
         target_id=target.id,
+        authorization_request_id=authorization_request_id,
         requested_by=owner_id,
         scan_type=scan_type,
         status="queued",

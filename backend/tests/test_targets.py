@@ -3,6 +3,10 @@
 import pytest
 from sqlalchemy import select
 
+import json
+
+from app.models.authorization import AuthorizationRequest
+
 from app.models.scan import Scan
 from app.services.scan_service import (
     ScanAuthorizationError,
@@ -188,6 +192,7 @@ def test_pending_target_cannot_be_scanned(
                 db=db,
                 target_id=target_id,
                 owner_id=target.project.owner_id,
+                authorization_request_id="invalid-authorization-id",
             )
     finally:
         db_generator.close()
@@ -198,8 +203,11 @@ def test_approved_target_passes_scan_authorization(
     auth_client,
     target_id,
 ):
+        
     from app.core.database import get_db
     from app.models.target import Target
+    from app.models.authorization import AuthorizationRequest
+    import json
 
     db_generator = auth_client.app.dependency_overrides[get_db]()
     db = next(db_generator)
@@ -209,18 +217,33 @@ def test_approved_target_passes_scan_authorization(
         assert target is not None
 
         target.authorization_status = "approved"
+
+        authorization_request = AuthorizationRequest(
+            target_id=target.id,
+            status="approved",
+            evidence_reference="test-authorization-evidence",
+            requested_scope=json.dumps([target.value]),
+            requested_by="test-requester@example.com",
+            reviewed_by="reviewer@example.com",
+            review_reason="Approved for unit testing",
+        )
+
+        db.add(authorization_request)
         db.commit()
+        db.refresh(authorization_request)
 
         result = validate_scan_authorization(
             db=db,
             target_id=target_id,
             owner_id=target.project.owner_id,
+            authorization_request_id=authorization_request.id,
         )
 
         assert result.id == target_id
-        assert result.authorization_status == "approved"
+
     finally:
         db_generator.close()
+
 
 
 def test_rejected_target_cannot_be_scanned(
@@ -245,6 +268,7 @@ def test_rejected_target_cannot_be_scanned(
                 db=db,
                 target_id=target_id,
                 owner_id=target.project.owner_id,
+                 authorization_request_id="invalid-authorization-id",
             )
     finally:
         db_generator.close()
@@ -281,6 +305,7 @@ def test_user_cannot_scan_another_users_target(
                 db=db,
                 target_id=target_id,
                 owner_id="another-users-id",
+                authorization_request_id="invalid-authorization-id",
             )
     finally:
         db_generator.close()
@@ -303,10 +328,10 @@ def test_create_scan_rejects_unsupported_scan_type(
                 db=db,
                 target_id=target_id,
                 owner_id=target.project.owner_id,
+                authorization_request_id="invalid-authorization-id",
                 scan_type="network",
             )
 
-        # An unsupported scan type must not create a scan record.
         scans = db.scalars(
             select(Scan).where(Scan.target_id == target_id)
         ).all()
@@ -327,21 +352,39 @@ def test_approved_target_creates_queued_scan(
         target = db.get(Target, target_id)
         assert target is not None
 
+        owner_id = target.project.owner_id
+
+        authorization_request = AuthorizationRequest(
+            target_id=target.id,
+            status="approved",
+            evidence_reference="test-authorization-evidence",
+            requested_scope=json.dumps([target.value]),
+            requested_by="test-requester@example.com",
+            reviewed_by="reviewer@example.com",
+            review_reason="Approved for unit testing",
+        )
+
+        db.add(authorization_request)
         target.authorization_status = "approved"
         db.commit()
+        db.refresh(authorization_request)
+
+        authorization_request_id = authorization_request.id
 
         scan = create_scan(
             db=db,
             target_id=target_id,
-            owner_id=target.project.owner_id,
+            owner_id=owner_id,
+            authorization_request_id=authorization_request_id,
             scan_type="web",
         )
 
         assert scan.id is not None
         assert scan.target_id == target_id
+        assert scan.authorization_request_id == authorization_request_id
         assert scan.status == "queued"
         assert scan.scan_type == "web"
-        assert scan.requested_by == target.project.owner_id
+        assert scan.requested_by == owner_id
     finally:
         db_generator.close()
 

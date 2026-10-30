@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
+from app.models.authorization import AuthorizationRequest
 from app.core.database import Base
 
 
@@ -31,6 +31,13 @@ class Scan(Base):
         index=True,
     )
 
+    authorization_request_id: Mapped[str | None] = mapped_column(
+    String(36),
+    ForeignKey("authorization_requests.id", ondelete="RESTRICT"),
+    nullable=True,
+    index=True,
+    )
+    
     requested_by: Mapped[str] = mapped_column(
         String(36),
         ForeignKey("users.id", ondelete="RESTRICT"),
@@ -91,3 +98,4 @@ class Scan(Base):
 
     target: Mapped["Target"] = relationship()
     requester: Mapped["User"] = relationship()
+    authorization_request: Mapped["AuthorizationRequest | None"] = relationship()

@@ -71,6 +71,7 @@ def create_new_scan(
             db=db,
             target_id=scan_data.target_id,
             owner_id=current_user.id,
+            authorization_request_id=scan_data.authorization_request_id,
             scan_type=scan_data.scan_type,
         )
         return scan

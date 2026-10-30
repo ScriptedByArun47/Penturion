@@ -9,13 +9,25 @@ from app.main import app
 
 
 def test_create_scan_requires_approved_target(auth_client, target_id):
+    from tests.test_scan_lifecycle import (
+        create_approved_authorization,
+    )
+
+    authorization_request_id = create_approved_authorization(
+        auth_client,
+        target_id,
+    )
+
+    # A genuinely pending request must not authorize a scan.
     db_generator = auth_client.app.dependency_overrides[get_db]()
     db = next(db_generator)
 
     try:
         target = db.get(Target, target_id)
         assert target is not None
-        assert target.authorization_status == "pending"
+
+        target.authorization_status = "pending"
+        db.commit()
     finally:
         db_generator.close()
 
@@ -23,6 +35,7 @@ def test_create_scan_requires_approved_target(auth_client, target_id):
         "/api/v1/scans",
         json={
             "target_id": target_id,
+            "authorization_request_id": authorization_request_id,
             "scan_type": "web",
         },
     )
@@ -32,27 +45,25 @@ def test_create_scan_requires_approved_target(auth_client, target_id):
 
 
 def test_create_scan_for_approved_target(auth_client, target_id):
-    db_generator = auth_client.app.dependency_overrides[get_db]()
-    db = next(db_generator)
+    from tests.test_scan_lifecycle import (
+        create_approved_authorization,
+    )
 
-    try:
-        target = db.get(Target, target_id)
-        assert target is not None
-
-        target.authorization_status = "approved"
-        db.commit()
-    finally:
-        db_generator.close()
+    authorization_request_id = create_approved_authorization(
+        auth_client,
+        target_id,
+    )
 
     response = auth_client.post(
         "/api/v1/scans",
         json={
             "target_id": target_id,
+            "authorization_request_id": authorization_request_id,
             "scan_type": "web",
         },
     )
 
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
 
     data = response.json()
     assert data["target_id"] == target_id

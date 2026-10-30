@@ -10,6 +10,7 @@ class ScanCreate(BaseModel):
     """Request to create a scan for an authorized target."""
 
     target_id: str = Field(min_length=1, max_length=36)
+    authorization_request_id: str = Field(min_length=36, max_length=36)
     scan_type: Literal["web"] = "web"
 
 

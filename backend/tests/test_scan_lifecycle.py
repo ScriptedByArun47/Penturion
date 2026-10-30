@@ -1,6 +1,9 @@
 
 import pytest
 
+import json
+
+from app.models.authorization import AuthorizationRequest
 from app.core.database import get_db
 from app.models.scan import Scan
 from app.models.target import Target
@@ -29,28 +32,73 @@ def get_user_id(client, email):
         db_generator.close()
 
 
-def create_queued_scan(auth_client, target_id):
-    """Create a queued scan after approving the target."""
+def create_approved_authorization(auth_client, target_id):
+    """Create and approve an authorization request for the target."""
+
     db_generator, db = get_test_db(auth_client)
 
     try:
         target = db.get(Target, target_id)
         assert target is not None
 
-        target.authorization_status = "approved"
-        db.commit()
+        target_value = target.value
+        owner_id = target.project.owner_id
     finally:
         db_generator.close()
 
     response = auth_client.post(
+        "/api/v1/authorization-requests",
+        json={
+            "target_id": target_id,
+            "evidence_reference": "test-scan-authorization",
+            "requested_scope": json.dumps([target_value]),
+            "requested_by": "test-requester",
+        },
+    )
+
+    assert response.status_code in (200, 201), response.text
+
+    authorization_request = response.json()
+    request_id = authorization_request["id"]
+
+    review_response = auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/review",
+        json={
+            "status": "approved",
+            "review_reason": "Approved for automated testing",
+        },
+    )
+
+    assert review_response.status_code == 200, review_response.text
+    assert review_response.json()["status"] == "approved"
+
+    return request_id
+
+
+def create_queued_scan(auth_client, target_id):
+    """Create a queued scan with an approved authorization request."""
+
+    authorization_request_id = create_approved_authorization(
+        auth_client,
+        target_id,
+    )
+
+    response = auth_client.post(
         "/api/v1/scans",
-        json={"target_id": target_id, "scan_type": "web"},
+        json={
+            "target_id": target_id,
+            "authorization_request_id": authorization_request_id,
+            "scan_type": "web",
+        },
     )
 
     assert response.status_code == 201, response.text
     assert response.json()["status"] == "queued"
-    return response.json()["id"]
+    assert (
+        response.json()["target_id"] == target_id
+    )
 
+    return response.json()["id"]
 
 def test_queued_scan_can_start(auth_client, target_id):
     scan_id = create_queued_scan(auth_client, target_id)
