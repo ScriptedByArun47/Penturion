@@ -40,29 +40,45 @@ class ScanLifecycleError(Exception):
     
 class ScanAuthorizationError(Exception):
     """Raised when a scan request is not authorized."""
-
 def validate_approved_scope(
     request: AuthorizationRequest,
     target: Target,
 ) -> None:
-    """Verify that an approved request's scope covers the actual target."""
+    """Verify that an approved request is valid, unexpired, and covers the target."""
 
+    # 1. Verify approval status.
     if request.status != "approved":
         raise ScanAuthorizationError(
             "The authorization request is not approved"
         )
 
+    # 2. Reject expired authorization.
+    if request.expires_at is not None:
+        expires_at = request.expires_at
+
+        # SQLite may return naive datetimes even when timezone=True.
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        if expires_at <= datetime.now(timezone.utc):
+            raise ScanAuthorizationError(
+                "Authorization has expired; scan execution denied"
+            )
+
+    # 3. Verify that authorization belongs to this target.
     if request.target_id != target.id:
         raise ScanAuthorizationError(
             "Authorization request does not belong to this target"
         )
 
+    # 4. Validate the approved scope.
     try:
         canonical_scope = validate_authorization_scope(
             requested_scope=request.requested_scope,
             target_value=target.value,
             target_type=target.target_type,
         )
+
         entries = json.loads(canonical_scope)
 
         if target.target_type == "domain":
@@ -101,11 +117,16 @@ def validate_approved_scope(
                 "Unsupported target type"
             )
 
-    except (AuthorizationScopeError, ScopeValidationError, ValueError) as exc:
+    except (
+        AuthorizationScopeError,
+        ScopeValidationError,
+        ValueError,
+    ) as exc:
         raise ScanAuthorizationError(
             "Authorization scope validation failed"
         ) from exc
 
+    # 5. Reject targets outside the approved scope.
     if not covered:
         raise ScanAuthorizationError(
             "The approved scope does not cover the scan target"
@@ -235,10 +256,8 @@ def validate_scan_for_execution(
             request=authorization_request,
             target=scan.target,
         )
-    except ScanAuthorizationError as exc:
-        raise ScanAuthorizationError(
-            "Target authorization is no longer valid for execution"
-        ) from exc
+    except ScanAuthorizationError:
+        raise
 
     return scan
 

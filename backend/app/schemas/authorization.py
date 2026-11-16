@@ -6,7 +6,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-AuthorizationStatus = Literal["pending", "approved", "rejected"]
+AuthorizationStatus = Literal[
+    "pending",
+    "approved",
+    "rejected",
+    "revoked",
+    "expired",
+]
 
 
 class AuthorizationRequestCreate(BaseModel):
@@ -53,6 +59,7 @@ class AuthorizationReview(BaseModel):
         min_length=1,
         max_length=5000,
     )
+    validity_days: int = Field(default=90, ge=1, le=365)
 
     @field_validator("review_reason")
     @classmethod
@@ -79,3 +86,6 @@ class AuthorizationRequestResponse(BaseModel):
     review_reason: str | None
     reviewed_at: datetime | None
     created_at: datetime
+    expires_at: datetime | None
+    revoked_by: str | None
+    revoked_at: datetime | None

@@ -12,6 +12,9 @@ from tests.test_scan_lifecycle import (
     create_queued_scan,
     get_test_db,
 )
+from datetime import datetime, timedelta, timezone
+
+from app.models.authorization import AuthorizationRequest
 
 
 def test_approved_target_passes_execution_check(
@@ -57,5 +60,44 @@ def test_revoked_authorization_blocks_execution(
             match="no longer approved",
         ):
             validate_scan_for_execution(db, scan_id)
+    finally:
+        db_generator.close()
+        
+
+def test_expired_authorization_blocks_execution(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        claimed = claim_next_scan(db)
+        assert claimed is not None
+        assert claimed.id == scan_id
+
+        scan = db.get(
+            __import__("app.models.scan", fromlist=["Scan"]).Scan,
+            scan_id,
+        )
+        assert scan is not None
+
+        authorization = db.get(
+            AuthorizationRequest,
+            scan.authorization_request_id,
+        )
+        assert authorization is not None
+
+        authorization.expires_at = (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        )
+        db.commit()
+
+        with pytest.raises(
+            ScanAuthorizationError,
+            match="Authorization has expired",
+        ):
+            validate_scan_for_execution(db, scan_id)
+
     finally:
         db_generator.close()

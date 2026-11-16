@@ -7,6 +7,8 @@ import httpx
 
 from app.scanners.base import ScanFinding, ScannerResult
 
+from app.scanners.transport.pinned_http import create_pinned_client
+
 
 SECURITY_HEADERS = {
     "content-security-policy": (
@@ -88,11 +90,9 @@ class HTTPScanner:
 
         owns_client = self.client is None
 
-        client = self.client or httpx.Client(
-            timeout=self.timeout,
-            follow_redirects=False,
-            trust_env=False,
-        )
+        client = self.client or create_pinned_client(
+             timeout=self.timeout,
+            )
 
         try:
             response = client.get(validated_target)

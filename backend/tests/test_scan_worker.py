@@ -588,3 +588,46 @@ def test_worker_cannot_complete_scan_after_lease_expires(
 
     finally:
         db_generator.close()
+        
+def test_worker_fails_queued_scan_after_authorization_api_revocation(
+    auth_client, target_id
+):
+    # 1. Create a scan with approved authorization.
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    # 2. Retrieve the authorization request ID linked to the scan.
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        scan = db.get(Scan, scan_id)
+        assert scan is not None
+
+        authorization_request_id = scan.authorization_request_id
+        assert authorization_request_id is not None
+    finally:
+        db_generator.close()
+
+    # 3. Revoke authorization through the actual API.
+    revoke_response = auth_client.patch(
+        f"/api/v1/authorization-requests/"
+        f"{authorization_request_id}/revoke"
+    )
+
+    assert revoke_response.status_code == 200
+    assert revoke_response.json()["status"] == "revoked"
+
+    # 4. Let the worker process the queued scan.
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        processed = process_next_scan(db)
+
+        # 5. Verify that execution was denied.
+        assert processed is not None
+        assert processed.id == scan_id
+        assert processed.status == "failed"
+        assert "no longer approved" in processed.error_message
+        assert processed.completed_at is not None
+
+    finally:
+        db_generator.close()

@@ -370,3 +370,201 @@ def test_user_cannot_get_another_users_request(
     )
 
     assert response.status_code == 404
+    
+
+def test_successful_authorization_revocation(
+    auth_client,
+    authorization_request,
+    target_id,
+    reviewer_token,
+):
+    token, reviewer_id = reviewer_token
+    request_id = authorization_request["id"]
+
+    # Approve first.
+    auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/review",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "approved",
+            "review_reason": "Approved for testing",
+        },
+    )
+
+    # Revoke approval.
+    response = auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/revoke",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["status"] == "revoked"
+    assert data["revoked_by"] == reviewer_id
+    assert data["revoked_at"] is not None
+
+    target_response = auth_client.get(
+        f"/api/v1/targets/{target_id}"
+    )
+
+    assert target_response.json()["authorization_status"] == "revoked"
+
+
+def test_already_revoked_request_cannot_be_revoked_again(
+    auth_client,
+    authorization_request,
+    reviewer_token,
+):
+    token, _ = reviewer_token
+    request_id = authorization_request["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/review",
+        headers=headers,
+        json={
+            "status": "approved",
+            "review_reason": "Approved",
+        },
+    )
+
+    first_response = auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/revoke",
+        headers=headers,
+    )
+
+    assert first_response.status_code == 200
+
+    second_response = auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/revoke",
+        headers=headers,
+    )
+
+    assert second_response.status_code == 409
+
+
+def test_pending_request_cannot_be_revoked(
+    auth_client,
+    authorization_request,
+):
+    response = auth_client.patch(
+        f"/api/v1/authorization-requests/"
+        f"{authorization_request['id']}/revoke"
+    )
+
+    assert response.status_code == 409
+
+
+def test_rejected_request_cannot_be_revoked(
+    auth_client,
+    authorization_request,
+):
+    request_id = authorization_request["id"]
+
+    auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/review",
+        json={
+            "status": "rejected",
+            "review_reason": "Rejected",
+        },
+    )
+
+    response = auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/revoke"
+    )
+
+    assert response.status_code == 409
+
+
+def test_non_reviewer_cannot_revoke_authorization(
+    auth_client,
+    authorization_request,
+    reviewer_token,
+    second_auth_client,
+):
+    token, _ = reviewer_token
+    request_id = authorization_request["id"]
+
+    auth_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/review",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "status": "approved",
+            "review_reason": "Approved",
+        },
+    )
+
+    second_client, _ = second_auth_client
+
+    response = second_client.patch(
+        f"/api/v1/authorization-requests/{request_id}/revoke"
+    )
+
+    assert response.status_code == 403
+
+
+def test_revoking_one_approval_preserves_another(
+    auth_client,
+    authorization_request,
+    target_id,
+    reviewer_token,
+):
+    token, _ = reviewer_token
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_id = authorization_request["id"]
+
+    # Create another authorization request for the same target.
+    second_response = auth_client.post(
+        "/api/v1/authorization-requests",
+        json={
+            "target_id": target_id,
+            "evidence_reference": "second-approval",
+            "requested_scope": '["example.com"]',
+            "requested_by": "test-requester",
+        },
+    )
+
+    assert second_response.status_code == 201
+    second_id = second_response.json()["id"]
+
+    # Approve both requests.
+    for request_id in (first_id, second_id):
+        response = auth_client.patch(
+            f"/api/v1/authorization-requests/{request_id}/review",
+            headers=headers,
+            json={
+                "status": "approved",
+                "review_reason": "Approved",
+            },
+        )
+        assert response.status_code == 200
+
+    # Revoke the first approval.
+    response = auth_client.patch(
+        f"/api/v1/authorization-requests/{first_id}/revoke",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+
+    target_response = auth_client.get(
+        f"/api/v1/targets/{target_id}"
+    )
+
+    assert target_response.json()["authorization_status"] == "approved"
+
+    # Revoke the second approval.
+    response = auth_client.patch(
+        f"/api/v1/authorization-requests/{second_id}/revoke",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+
+    target_response = auth_client.get(
+        f"/api/v1/targets/{target_id}"
+    )
+
+    assert target_response.json()["authorization_status"] == "revoked"

@@ -153,3 +153,37 @@ def test_scanner_does_not_follow_redirects():
 
     finally:
         client.close()
+
+def test_scanner_uses_pinned_client_by_default(monkeypatch):
+    from app.scanners.adapters import http_scanner
+    from app.scanners.transport.pinned_http import PinnedHTTPTransport
+
+    created_clients = []
+
+    def tracked_factory(*, timeout):
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-security-policy": "default-src 'self'"},
+                )
+            ),
+            timeout=timeout,
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        http_scanner,
+        "create_pinned_client",
+        tracked_factory,
+    )
+
+    scanner = HTTPScanner()
+    result = scanner.execute("https://example.test")
+
+    assert len(created_clients) == 1
+    assert result.success is True
+    assert len(result.findings) == 2
+
+    created_clients[0].close()

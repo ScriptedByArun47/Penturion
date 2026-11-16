@@ -10,6 +10,8 @@ AuthorizationStatus = Literal[
     "pending",
     "approved",
     "rejected",
+    "revoked",
+    "expired",
 ]
 
 

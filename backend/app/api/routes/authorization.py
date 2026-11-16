@@ -128,3 +128,41 @@ def review_request(
         )
 
     return request
+
+@router.patch(
+    "/{request_id}/revoke",
+    response_model=AuthorizationRequestResponse,
+)
+def revoke_request(
+    request_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_reviewer),
+):
+    try:
+        request = authorization_service.revoke_authorization_request(
+            db=db,
+            request_id=request_id,
+            revoked_by=current_user.id,
+        )
+
+    except ValueError as exc:
+        message = str(exc)
+
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if message == "Target not found"
+            else status.HTTP_409_CONFLICT
+        )
+
+        raise HTTPException(
+            status_code=code,
+            detail=message,
+        ) from exc
+
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Authorization request not found",
+        )
+
+    return request
