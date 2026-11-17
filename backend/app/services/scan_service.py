@@ -15,6 +15,9 @@ from app.models.target import Target
 import ipaddress
 import json
 
+from app.models.finding import Finding
+from app.scanners.adapters.http_scanner import HTTPScanner
+
 from app.models.authorization import AuthorizationRequest
 from app.scanners.scope import (
     ScopeValidationError,
@@ -495,14 +498,22 @@ def transition_scan(
 
 
 def process_next_scan(db: Session) -> Scan | None:
-    """Claim a scan and validate authorization without executing it."""
+    """Claim, authorize, execute and persist one HTTP scan."""
 
     scan = claim_next_scan(db)
 
     if scan is None:
         return None
 
+    worker_id = scan.worker_id
+
+    if not worker_id:
+        raise ScanLifecycleError(
+            "Claimed scan has no assigned worker"
+        )
+
     try:
+        # 1. Revalidate authorization and target scope.
         validated_scan = validate_scan_for_execution(
             db=db,
             scan_id=scan.id,
@@ -513,28 +524,111 @@ def process_next_scan(db: Session) -> Scan | None:
                 "Scan disappeared during authorization validation"
             )
 
-        # Actual scanner execution remains intentionally disabled.
-        return validated_scan
+        target = validated_scan.target
+
+        # 2. Build the scanner input without changing target scope.
+        if target.target_type == "url":
+            scan_url = target.value
+
+        elif target.target_type == "domain":
+            hostname = normalize_hostname(target.value)
+            scan_url = f"https://{hostname}/"
+
+        else:
+            raise ScanLifecycleError(
+                "HTTP scanning does not support IP targets yet"
+            )
+
+        # 3. Verify this worker still owns an unexpired lease.
+        now = datetime.now(timezone.utc)
+
+        lease_valid = db.scalar(
+            select(Scan.id).where(
+                Scan.id == scan.id,
+                Scan.status == "running",
+                Scan.worker_id == worker_id,
+                Scan.lease_expires_at > now,
+            )
+        )
+
+        if lease_valid is None:
+            raise ScanLifecycleError(
+                "Worker lease expired before scanner execution"
+            )
+
+        # 4. Execute the low-impact HTTP scanner.
+        scanner = HTTPScanner()
+        result = scanner.execute(scan_url)
+
+        if not result.success:
+            return fail_running_scan(
+                db=db,
+                scan_id=scan.id,
+                error_message=result.error or "HTTP scanner failed",
+                worker_id=worker_id,
+            )
+
+        # 5. Validate and persist findings.
+        allowed_severities = {
+            "informational",
+            "low",
+            "medium",
+            "high",
+            "critical",
+        }
+
+        for item in result.findings:
+            severity = item.severity.lower()
+
+            if severity not in allowed_severities:
+                raise ValueError(
+                    "Scanner returned an unsupported severity"
+                )
+
+            db.add(
+                Finding(
+                    scan_id=scan.id,
+                    scanner_name=result.scanner_name,
+                    title=item.title,
+                    severity=severity,
+                    description=item.description,
+                    evidence=item.evidence,
+                    remediation=item.remediation,
+                )
+            )
+
+        # 6. Complete the scan.
+        # complete_running_scan commits the pending findings
+        # and the completion update in the same transaction.
+        return complete_running_scan(
+            db=db,
+            scan_id=scan.id,
+            worker_id=worker_id,
+        )
 
     except ScanAuthorizationError as exc:
         return fail_running_scan(
             db=db,
             scan_id=scan.id,
             error_message=str(exc),
-            worker_id=scan.worker_id,
+            worker_id=worker_id,
         )
 
+    except ScanLifecycleError:
+        db.rollback()
+        raise
+
     except Exception:
-        # Do not expose internal exception details in the scan record.
-        try:
-            return fail_running_scan(
-                db=db,
-                scan_id=scan.id,
-                error_message="Unexpected worker error during scan validation",
-                worker_id=scan.worker_id,
-            )
-        except ScanLifecycleError:
-            raise
+        db.rollback()
+
+        return fail_running_scan(
+            db=db,
+            scan_id=scan.id,
+            error_message=(
+                "Unexpected worker error during HTTP scanning"
+            ),
+            worker_id=worker_id,
+        )
 
 
 
@@ -693,10 +787,7 @@ def run_worker_cycle(
     db: Session,
     timeout_minutes: int = 30,
 ) -> Scan | None:
-    """Recover abandoned scans, then process one queued scan.
-
-    Scanner execution remains disabled.
-    """
+    """Recover abandoned scans, then execute one queued HTTP scan."""
 
     recover_abandoned_scans(
         db=db,

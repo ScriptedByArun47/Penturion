@@ -6,6 +6,9 @@ from unittest.mock import patch
 import pytest
 from app.services.scan_service import ScanAuthorizationError
 
+from app.models.finding import Finding
+from app.scanners.base import ScanFinding, ScannerResult
+
 from datetime import datetime, timedelta, timezone
 from app.services.scan_service import run_worker_cycle
 
@@ -23,21 +26,37 @@ from app.services.scan_service import (
     update_scan_heartbeat,
 )
 
-def test_worker_validates_authorized_scan_without_execution(
+def test_worker_executes_scanner_and_completes_scan(
     auth_client, target_id
 ):
     scan_id = create_queued_scan(auth_client, target_id)
 
     db_generator, db = get_test_db(auth_client)
 
+    mock_result = ScannerResult(
+        scanner_name="http",
+        target="https://scan-test.example.com/",
+        success=True,
+        findings=(),
+    )
+
     try:
-        processed = process_next_scan(db)
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute",
+            return_value=mock_result,
+        ) as mock_execute:
+            processed = process_next_scan(db)
 
         assert processed is not None
         assert processed.id == scan_id
-        assert processed.status == "running"
+        assert processed.status == "completed"
         assert processed.started_at is not None
-        assert processed.completed_at is None
+        assert processed.completed_at is not None
+
+        mock_execute.assert_called_once_with(
+            "https://scan-test.example.com/"
+        )
+
     finally:
         db_generator.close()
 
@@ -95,7 +114,7 @@ def test_worker_marks_scan_failed_on_unexpected_validation_error(
         assert processed.id == scan_id
         assert processed.status == "failed"
         assert processed.error_message == (
-            "Unexpected worker error during scan validation"
+          "Unexpected worker error during HTTP scanning"
         )
         assert processed.completed_at is not None
 
@@ -109,7 +128,7 @@ def test_recovery_fails_abandoned_scan(auth_client, target_id):
     db_generator, db = get_test_db(auth_client)
 
     try:
-        scan = process_next_scan(db)
+        scan = claim_next_scan(db)
 
         assert scan is not None
         assert scan.id == scan_id
@@ -140,7 +159,7 @@ def test_recovery_preserves_recent_running_scan(auth_client, target_id):
     db_generator, db = get_test_db(auth_client)
 
     try:
-        scan = process_next_scan(db)
+        scan = claim_next_scan(db)
 
         assert scan is not None
         assert scan.status == "running"
@@ -179,7 +198,7 @@ def test_worker_cycle_recovers_abandoned_scans_and_processes_queue(
     db_generator, db = get_test_db(auth_client)
 
     try:
-        first = process_next_scan(db)
+        first = claim_next_scan(db)
         assert first is not None
         assert first.status == "running"
 
@@ -190,11 +209,22 @@ def test_worker_cycle_recovers_abandoned_scans_and_processes_queue(
 
         second_id = create_queued_scan(auth_client, target_id)
 
-        result = run_worker_cycle(db, timeout_minutes=30)
+        mock_result = ScannerResult(
+            scanner_name="http",
+            target="https://scan-test.example.com/",
+            success=True,
+            findings=(),
+        )
+
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute",
+            return_value=mock_result,
+        ):
+            result = run_worker_cycle(db, timeout_minutes=30)
 
         assert result is not None
         assert result.id == second_id
-        assert result.status == "running"
+        assert result.status == "completed"
 
         db.refresh(first)
         assert first.status == "failed"
@@ -223,7 +253,7 @@ def test_recovery_preserves_scan_with_recent_heartbeat(
     db_generator, db = get_test_db(auth_client)
 
     try:
-        scan = process_next_scan(db)
+        scan = claim_next_scan(db)
         assert scan is not None
         assert scan.status == "running"
 
@@ -255,7 +285,7 @@ def test_recovery_fails_scan_with_stale_heartbeat(
     db_generator, db = get_test_db(auth_client)
 
     try:
-        scan = process_next_scan(db)
+        scan = claim_next_scan(db)
         assert scan is not None
         assert scan.status == "running"
 
@@ -628,6 +658,84 @@ def test_worker_fails_queued_scan_after_authorization_api_revocation(
         assert processed.status == "failed"
         assert "no longer approved" in processed.error_message
         assert processed.completed_at is not None
+
+    finally:
+        db_generator.close()
+
+def test_worker_persists_scanner_findings(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    mock_finding = ScanFinding(
+        title="Missing Content-Security-Policy header",
+        severity="low",
+        description="The application does not return a CSP header.",
+        evidence={
+            "missing_header": "content-security-policy",
+            "http_status": 200,
+        },
+        remediation="Configure an appropriate Content-Security-Policy.",
+    )
+
+    mock_result = ScannerResult(
+        scanner_name="http",
+        target="https://scan-test.example.com/",
+        success=True,
+        findings=(mock_finding,),
+    )
+
+    try:
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute",
+            return_value=mock_result,
+        ):
+            processed = process_next_scan(db)
+
+        assert processed is not None
+        assert processed.status == "completed"
+
+        findings = (
+            db.query(Finding)
+            .filter(Finding.scan_id == scan_id)
+            .all()
+        )
+
+        assert len(findings) == 1
+        assert findings[0].scanner_name == "http"
+        assert findings[0].severity == "low"
+        assert findings[0].evidence["http_status"] == 200
+
+    finally:
+        db_generator.close()
+        
+def test_worker_fails_when_http_scanner_fails(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    mock_result = ScannerResult(
+        scanner_name="http",
+        target="https://scan-test.example.com/",
+        success=False,
+        error="HTTP request timed out",
+    )
+
+    try:
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute",
+            return_value=mock_result,
+        ):
+            processed = process_next_scan(db)
+
+        assert processed is not None
+        assert processed.id == scan_id
+        assert processed.status == "failed"
+        assert processed.error_message == "HTTP request timed out"
 
     finally:
         db_generator.close()

@@ -38,7 +38,7 @@ class HTTPScanner:
 
     def __init__(
         self,
-        timeout: float = 5.0,
+        timeout: float = 30.0,
         client: httpx.Client | None = None,
     ) -> None:
         if timeout <= 0:
