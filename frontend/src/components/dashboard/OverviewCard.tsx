@@ -3,7 +3,7 @@ export default function OverviewCard({
   value,
 }: {
   label: string;
-  value: number;
+  value: number | string;
 }) {
   return (
     <div className="card stat">

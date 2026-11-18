@@ -29,7 +29,7 @@ export interface ProjectUpdate { name?: string; description?: string | null; sta
 
 // ---------- Targets ----------
 export type TargetType = "domain" | "ip" | "url";
-export type AuthorizationStatus = "pending" | "approved" | "rejected";
+export type AuthorizationStatus = "pending" | "approved" | "rejected" | "revoked" | "expired";
 export interface Target {
   id: string;
   project_id: string;
@@ -54,6 +54,9 @@ export interface AuthorizationRequest {
   review_reason: string | null;
   reviewed_at: string | null;
   created_at: string;
+  expires_at?: string | null;
+  revoked_by?: string | null;
+  revoked_at?: string | null;
 }
 export interface AuthorizationRequestCreate {
   target_id: string;
@@ -64,16 +67,46 @@ export interface AuthorizationRequestCreate {
 export interface AuthorizationReview {
   status: "approved" | "rejected";
   review_reason: string;
+  validity_days?: number;
+}
+
+// ---------- Scans (real backend) ----------
+export type ScanStatus = "queued" | "running" | "completed" | "failed";
+
+export interface Scan {
+  id: string;
+  target_id: string;
+  requested_by: string;
+  status: ScanStatus | string;
+  scan_type: string;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface ScanCreate {
+  target_id: string;
+  authorization_request_id: string;
+  scan_type?: "web";
 }
 
 // ---------- API errors ----------
 export interface ApiValidationError { loc: (string | number)[]; msg: string; type: string }
 
-// ---------- Mock-only (no backend yet) ----------
+// ---------- Mock-only (Findings & Reports pending backend) ----------
 export type Severity = "Critical" | "High" | "Medium" | "Low" | "Informational";
-export type ScanStatus = "Completed" | "Running" | "Failed" | "Queued";
 export type FindingStatus = "Open" | "In Review" | "Resolved";
 
-export interface Scan { id: string; target: string; status: ScanStatus; findings: number; started: string; ended?: string }
 export interface Finding { id: string; title: string; severity: Severity; target: string; status: FindingStatus }
 export interface Report { id: string; name: string; project: string; generated: string }
+
+// Mock scan definition for fallback and sample dashboard
+export interface MockScan {
+  id: string;
+  target: string;
+  status: string;
+  findings: number;
+  started: string;
+  ended?: string;
+}

@@ -28,3 +28,11 @@ export function reviewAuthorizationRequest(
     json: input,
   });
 }
+
+export function revokeAuthorizationRequest(
+  id: string,
+): Promise<AuthorizationRequest> {
+  return apiRequest<AuthorizationRequest>(`/authorization-requests/${id}/revoke`, {
+    method: "PATCH",
+  });
+}

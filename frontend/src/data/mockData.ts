@@ -1,5 +1,5 @@
 // Illustrative mock data only, not real scan results.
-import type { Finding, Project, Report, Scan, Severity, Target } from "../types";
+import type { Finding, MockScan, Project, Report, Severity, Target } from "../types";
 
 export const projects: Project[] = [
   { id: "prj-001", name: "Internal Web Apps", description: "Quarterly assessment of internal tools", status: "active", created_at: "2026-09-01T09:00:00Z", updated_at: "2026-09-01T09:00:00Z" },
@@ -14,7 +14,7 @@ export const targets: Target[] = [
 ];
 
 // Scans, findings and reports have no backend yet, so they stay mock-only.
-export const scans: Scan[] = [
+export const scans: MockScan[] = [
   { id: "SCAN-001", target: "demo.example.com", status: "Completed", findings: 5, started: "2026-10-18 09:00", ended: "2026-10-18 09:42" },
   { id: "SCAN-002", target: "staging.example.com", status: "Running", findings: 2, started: "2026-10-18 10:10" },
   { id: "SCAN-003", target: "10.0.0.15", status: "Failed", findings: 0, started: "2026-10-17 15:30", ended: "2026-10-17 15:31" },

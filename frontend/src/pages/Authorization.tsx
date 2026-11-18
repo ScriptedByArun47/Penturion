@@ -6,6 +6,7 @@ import {
   createAuthorizationRequest,
   listAuthorizationRequests,
   reviewAuthorizationRequest,
+  revokeAuthorizationRequest,
 } from "../api/authorization";
 import type { AuthorizationRequest, Project, Target } from "../types";
 import DataTable from "../components/common/DataTable";
@@ -75,7 +76,7 @@ export default function Authorization() {
         target_id: targetId,
         evidence_reference: evidence.trim(),
         requested_scope: scope.trim(),
-        requested_by: user.email, // TODO: remove once the backend derives it from the token
+        requested_by: user.email,
       });
       setRequests((prev) => [...prev, created]);
       setEvidence("");
@@ -94,9 +95,28 @@ export default function Authorization() {
     setError(null);
     setNotice(null);
     try {
-      await reviewAuthorizationRequest(request.id, { status, review_reason: reason.trim() });
+      await reviewAuthorizationRequest(request.id, {
+        status,
+        review_reason: reason.trim(),
+        validity_days: 90,
+      });
       setNotice(`Request ${status}.`);
-      await load(); // refresh so the target's authorization status is current too
+      await load();
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+
+  const onRevoke = async (request: AuthorizationRequest) => {
+    if (!window.confirm("Are you sure you want to revoke this authorization? Any further scans for this target will be denied.")) {
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    try {
+      await revokeAuthorizationRequest(request.id);
+      setNotice("Authorization has been revoked.");
+      await load();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -125,7 +145,7 @@ export default function Authorization() {
           <input
             value={scope}
             onChange={(e) => setScope(e.target.value)}
-            placeholder="Requested scope"
+            placeholder="Requested scope (e.g. example.com, *.example.com)"
             maxLength={10000}
             required
           />
@@ -146,16 +166,29 @@ export default function Authorization() {
           { header: "Scope", render: (r) => r.requested_scope },
           { header: "Evidence", render: (r) => r.evidence_reference },
           { header: "Requested by", render: (r) => r.requested_by },
-          { header: "Review", render: (r) => r.review_reason ?? "-" },
           {
-            header: "",
+            header: "Expires",
+            render: (r) => (r.expires_at ? r.expires_at.slice(0, 10) : "-"),
+          },
+          { header: "Review Reason", render: (r) => r.review_reason ?? "-" },
+          {
+            header: "Actions",
             render: (r) =>
-              isReviewer && r.status === "pending" ? (
-                <span className="toolbar">
-                  <button onClick={() => void onReview(r, "approved")}>Approve</button>
-                  <button className="btn-danger" onClick={() => void onReview(r, "rejected")}>
-                    Reject
-                  </button>
+              isReviewer ? (
+                <span className="toolbar" style={{ margin: 0, gap: "6px" }}>
+                  {r.status === "pending" && (
+                    <>
+                      <button type="button" onClick={() => void onReview(r, "approved")}>Approve</button>
+                      <button type="button" className="btn-danger" onClick={() => void onReview(r, "rejected")}>
+                        Reject
+                      </button>
+                    </>
+                  )}
+                  {r.status === "approved" && (
+                    <button type="button" className="btn-danger" onClick={() => void onRevoke(r)}>
+                      Revoke
+                    </button>
+                  )}
                 </span>
               ) : null,
           },
