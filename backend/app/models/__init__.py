@@ -7,6 +7,7 @@ from app.models.scan import Scan
 from app.models.authorization import AuthorizationRequest
 from app.models.user import User
 from app.models.finding import Finding
+from app.models.agent_execution import AgentExecution
 
 __all__ = [
     "Base",
@@ -16,4 +17,5 @@ __all__ = [
     "User",
     "Scan",
     "Finding",
+    "AgentExecution",
 ]

@@ -99,3 +99,10 @@ class Scan(Base):
     target: Mapped["Target"] = relationship()
     requester: Mapped["User"] = relationship()
     authorization_request: Mapped["AuthorizationRequest | None"] = relationship()
+
+    agent_executions: Mapped[list["AgentExecution"]] = relationship(
+        "AgentExecution",
+        back_populates="scan",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
