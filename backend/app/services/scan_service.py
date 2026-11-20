@@ -14,6 +14,13 @@ from app.models.target import Target
 
 import ipaddress
 import json
+import logging
+logger = logging.getLogger(__name__)
+
+from collections.abc import Callable
+
+from app.core.database import SessionLocal
+from app.scanners.heartbeat import ScanHeartbeatKeeper
 
 from app.models.finding import Finding
 from app.scanners.adapters.http_scanner import HTTPScanner
@@ -496,8 +503,10 @@ def transition_scan(
         db.rollback()
         raise
 
-
-def process_next_scan(db: Session) -> Scan | None:
+def process_next_scan(
+    db: Session,
+    heartbeat_session_factory: Callable[[], Session] | None = None,
+) -> Scan | None:
     """Claim, authorize, execute and persist one HTTP scan."""
 
     scan = claim_next_scan(db)
@@ -512,11 +521,14 @@ def process_next_scan(db: Session) -> Scan | None:
             "Claimed scan has no assigned worker"
         )
 
+    scan_id = scan.id
+    keeper = None
+
     try:
         # 1. Revalidate authorization and target scope.
         validated_scan = validate_scan_for_execution(
             db=db,
-            scan_id=scan.id,
+            scan_id=scan_id,
         )
 
         if validated_scan is None:
@@ -526,12 +538,16 @@ def process_next_scan(db: Session) -> Scan | None:
 
         target = validated_scan.target
 
-        # 2. Build the scanner input without changing target scope.
-        if target.target_type == "url":
-            scan_url = target.value
+        # Capture target information before ending the read transaction.
+        target_type = target.target_type
+        target_value = target.value
 
-        elif target.target_type == "domain":
-            hostname = normalize_hostname(target.value)
+        # 2. Build the scanner input.
+        if target_type == "url":
+            scan_url = target_value
+
+        elif target_type == "domain":
+            hostname = normalize_hostname(target_value)
             scan_url = f"https://{hostname}/"
 
         else:
@@ -539,12 +555,12 @@ def process_next_scan(db: Session) -> Scan | None:
                 "HTTP scanning does not support IP targets yet"
             )
 
-        # 3. Verify this worker still owns an unexpired lease.
+        # 3. Verify that this worker owns a valid lease.
         now = datetime.now(timezone.utc)
 
         lease_valid = db.scalar(
             select(Scan.id).where(
-                Scan.id == scan.id,
+                Scan.id == scan_id,
                 Scan.status == "running",
                 Scan.worker_id == worker_id,
                 Scan.lease_expires_at > now,
@@ -556,19 +572,83 @@ def process_next_scan(db: Session) -> Scan | None:
                 "Worker lease expired before scanner execution"
             )
 
-        # 4. Execute the low-impact HTTP scanner.
-        scanner = HTTPScanner()
-        result = scanner.execute(scan_url)
+        # End the main session's read transaction before heartbeat writes.
+        db.rollback()
 
+        session_factory = heartbeat_session_factory or SessionLocal
+        
+        # 4. Start independent background heartbeat management.
+        keeper = ScanHeartbeatKeeper(
+            session_factory=session_factory,
+            heartbeat_callback=update_scan_heartbeat,
+            scan_id=scan_id,
+            worker_id=worker_id,
+            lease_seconds=60,
+            heartbeat_interval=20,
+        )
+
+        keeper.start()
+
+        # 5. Execute the HTTP scanner and stop heartbeat management.
+        scanner_error = None
+        result = None
+
+        try:
+            result = HTTPScanner(
+                    cancel_event=keeper.cancel_event
+                ).execute(scan_url)
+
+        except Exception as exc:
+            scanner_error = exc
+
+        finally:
+            stopped = keeper.stop(timeout=5)
+
+        if not stopped:
+            raise ScanLifecycleError(
+                "Heartbeat thread did not stop within the allowed time"
+            )
+
+    # 6. Refuse to continue if lease ownership was lost.
+        if keeper.lease_lost:
+            raise ScanLifecycleError(
+                keeper.failure_reason or "Worker lease was lost"
+            )
+
+        if scanner_error is not None:
+            raise scanner_error
+
+        
+        
+
+        # Check the current lease again. This also protects short scans
+        # that finish before the first periodic heartbeat.
+        now = datetime.now(timezone.utc)
+
+        lease_valid = db.scalar(
+            select(Scan.id).where(
+                Scan.id == scan_id,
+                Scan.status == "running",
+                Scan.worker_id == worker_id,
+                Scan.lease_expires_at > now,
+            )
+        )
+
+        if lease_valid is None:
+            raise ScanLifecycleError(
+                "Worker lease expired during scanner execution"
+            )
+
+        # 7. Handle scanner failure.
         if not result.success:
             return fail_running_scan(
                 db=db,
-                scan_id=scan.id,
+                scan_id=scan_id,
                 error_message=result.error or "HTTP scanner failed",
                 worker_id=worker_id,
             )
 
-        # 5. Validate and persist findings.
+        # 8. Validate and persist findings.
         allowed_severities = {
             "informational",
             "low",
@@ -587,7 +667,7 @@ def process_next_scan(db: Session) -> Scan | None:
 
             db.add(
                 Finding(
-                    scan_id=scan.id,
+                    scan_id=scan_id,
                     scanner_name=result.scanner_name,
                     title=item.title,
                     severity=severity,
@@ -597,19 +677,18 @@ def process_next_scan(db: Session) -> Scan | None:
                 )
             )
 
-        # 6. Complete the scan.
-        # complete_running_scan commits the pending findings
-        # and the completion update in the same transaction.
+        # 9. Complete the scan.
+        # Findings and completion remain in one transaction.
         return complete_running_scan(
             db=db,
-            scan_id=scan.id,
+            scan_id=scan_id,
             worker_id=worker_id,
         )
 
     except ScanAuthorizationError as exc:
         return fail_running_scan(
             db=db,
-            scan_id=scan.id,
+            scan_id=scan_id,
             error_message=str(exc),
             worker_id=worker_id,
         )
@@ -623,13 +702,20 @@ def process_next_scan(db: Session) -> Scan | None:
 
         return fail_running_scan(
             db=db,
-            scan_id=scan.id,
+            scan_id=scan_id,
             error_message=(
                 "Unexpected worker error during HTTP scanning"
             ),
             worker_id=worker_id,
         )
 
+    finally:
+       if keeper is not None:
+            if not keeper.stop(timeout=5):
+                logger.error(
+                    "Heartbeat thread did not stop: scan_id=%s",
+                    scan_id,
+                )
 
 
 def fail_running_scan(

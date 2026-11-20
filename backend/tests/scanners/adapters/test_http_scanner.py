@@ -2,6 +2,7 @@
 
 import httpx
 import pytest
+import threading
 
 from app.scanners.adapters.http_scanner import HTTPScanner
 
@@ -187,3 +188,141 @@ def test_scanner_uses_pinned_client_by_default(monkeypatch):
     assert len(result.findings) == 2
 
     created_clients[0].close()
+
+def test_scanner_stops_before_request_when_cancelled():
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    request_count = 0
+
+    def request_handler(request):
+        nonlocal request_count
+        request_count += 1
+        return mock_response()
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(request_handler)
+    )
+
+    try:
+        scanner = HTTPScanner(
+            client=client,
+            cancel_event=cancel_event,
+        )
+
+        result = scanner.execute("https://example.test")
+
+        assert result.success is False
+        assert result.error == "Scan cancelled"
+        assert request_count == 0
+
+    finally:
+        client.close()
+
+def test_scanner_detects_cancellation_after_request():
+    cancel_event = threading.Event()
+
+    def request_handler(request):
+        cancel_event.set()
+        return mock_response()
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(request_handler)
+    )
+
+    try:
+        scanner = HTTPScanner(
+            client=client,
+            cancel_event=cancel_event,
+        )
+
+        result = scanner.execute("https://example.test")
+
+        assert result.success is False
+        assert result.error == "Scan cancelled"
+        assert result.findings == ()
+
+    finally:
+        client.close()
+        
+import threading
+
+
+def test_scanner_cancels_during_streaming():
+    cancel_event = threading.Event()
+
+    class TrackingStream(httpx.SyncByteStream):
+        closed = False
+
+        def __iter__(self):
+            cancel_event.set()
+            yield b"A" * 8192
+
+        def close(self):
+            self.closed = True
+
+    stream = TrackingStream()
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            stream=stream,
+            request=request,
+        )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler)
+    )
+
+    try:
+        scanner = HTTPScanner(
+            client=client,
+            cancel_event=cancel_event,
+        )
+
+        result = scanner.execute("https://example.test")
+
+        assert result.success is False
+        assert result.error == "Scan cancelled"
+        assert stream.closed is True
+
+    finally:
+        client.close()
+
+def test_scanner_limits_response_body_reading():
+    class TrackingStream(httpx.SyncByteStream):
+        def __init__(self):
+            self.chunks_yielded = 0
+            self.closed = False
+
+        def __iter__(self):
+            for _ in range(256):
+                self.chunks_yielded += 1
+                yield b"A" * 8192
+
+        def close(self):
+            self.closed = True
+
+    stream = TrackingStream()
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            stream=stream,
+            request=request,
+        )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler)
+    )
+
+    try:
+        scanner = HTTPScanner(client=client)
+        result = scanner.execute("https://example.test")
+
+        assert result.success is True
+        assert stream.chunks_yielded == 128
+        assert stream.closed is True
+
+    finally:
+        client.close()

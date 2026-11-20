@@ -5,6 +5,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+import threading
+
 from app.scanners.base import ScanFinding, ScannerResult
 
 from app.scanners.transport.pinned_http import create_pinned_client
@@ -40,13 +42,21 @@ class HTTPScanner:
         self,
         timeout: float = 30.0,
         client: httpx.Client | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
 
         self.timeout = timeout
         self.client = client
+        self.cancel_event = cancel_event
 
+    def _is_cancelled(self) -> bool:
+        """Check whether scanner execution has been cancelled."""
+        return (
+            self.cancel_event is not None
+            and self.cancel_event.is_set()
+        )
     @staticmethod
     def validate_url(target: str) -> str:
         """Validate basic URL syntax and permitted schemes."""
@@ -95,7 +105,66 @@ class HTTPScanner:
             )
 
         try:
-            response = client.get(validated_target)
+            if self._is_cancelled():
+                return ScannerResult(
+                    scanner_name="http",
+                    target=validated_target,
+                    success=False,
+                    error="Scan cancelled",
+                )
+                
+            with client.stream("GET", validated_target) as response:
+                body_size = 0
+                max_body_size = 1024 * 1024
+
+                for chunk in response.iter_bytes(chunk_size=8192):
+                    if self._is_cancelled():
+                        return ScannerResult(
+                            scanner_name="http",
+                            target=validated_target,
+                            success=False,
+                            error="Scan cancelled",
+                        )
+
+                    body_size += len(chunk)
+
+                    if body_size >= max_body_size:
+                        break
+
+                if self._is_cancelled():
+                    return ScannerResult(
+                        scanner_name="http",
+                        target=validated_target,
+                        success=False,
+                        error="Scan cancelled",
+                    )
+
+            findings = []
+
+            for header, (title, description) in SECURITY_HEADERS.items():
+                if header not in response.headers:
+                    findings.append(
+                        ScanFinding(
+                            title=title,
+                            severity="low",
+                            description=description,
+                            evidence={
+                                "missing_header": header,
+                                "http_status": response.status_code,
+                            },
+                            remediation=(
+                                f"Review whether the {header} header "
+                                "should be configured for this application."
+                            ),
+                        )
+                    )
+
+            return ScannerResult(
+                scanner_name="http",
+                target=validated_target,
+                success=True,
+                findings=tuple(findings),
+            )
             findings = []
 
             for header, (title, description) in SECURITY_HEADERS.items():

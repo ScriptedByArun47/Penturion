@@ -739,3 +739,529 @@ def test_worker_fails_when_http_scanner_fails(
 
     finally:
         db_generator.close()
+        
+def test_worker_renews_lease_during_long_running_scan(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import threading
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import app.services.scan_service as scan_service
+
+    from app.core.database import Base
+    from app.models.user import User
+    from app.models.project import Project
+    from app.models.target import Target
+    from app.models.authorization import AuthorizationRequest
+    from app.models.scan import Scan
+    from app.scanners.heartbeat import ScanHeartbeatKeeper
+    from app.scanners.base import ScannerResult
+
+    # Create a file-backed SQLite database.
+    database_path = tmp_path / "heartbeat_test.db"
+
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False},
+    )
+
+    TestSessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+
+    Base.metadata.create_all(bind=engine)
+
+    heartbeat_observed = threading.Event()
+
+    try:
+        # Seed a valid user, project, target, authorization and scan.
+        with TestSessionLocal() as db:
+            user = User(
+                email="heartbeat-test@example.com",
+                password_hash="test-hash",
+                role="user",
+                is_active=True,
+            )
+            db.add(user)
+            db.flush()
+
+            project = Project(
+                owner_id=user.id,
+                name="Heartbeat Integration Test",
+            )
+            db.add(project)
+            db.flush()
+
+            target = Target(
+                project_id=project.id,
+                value="heartbeat-test.example.com",
+                target_type="domain",
+                authorization_status="approved",
+            )
+            db.add(target)
+            db.flush()
+
+            authorization = AuthorizationRequest(
+                target_id=target.id,
+                status="approved",
+                evidence_reference="heartbeat-test-authorization",
+                requested_scope=json.dumps([target.value]),
+                requested_by="test-requester",
+            )
+            db.add(authorization)
+            db.flush()
+
+            scan = Scan(
+                target_id=target.id,
+                authorization_request_id=authorization.id,
+                requested_by=user.id,
+                scan_type="web",
+                status="queued",
+            )
+            db.add(scan)
+            db.commit()
+
+            scan_id = scan.id
+
+        # Use the real keeper with a shorter interval for this test.
+        def fast_keeper(**kwargs):
+            kwargs["heartbeat_interval"] = 0.05
+            return ScanHeartbeatKeeper(**kwargs)
+
+        monkeypatch.setattr(
+            scan_service,
+            "ScanHeartbeatKeeper",
+            fast_keeper,
+        )
+
+        # Observe successful real heartbeat renewals.
+        original_update = scan_service.update_scan_heartbeat
+
+        def observed_heartbeat(*args, **kwargs):
+            renewed = original_update(*args, **kwargs)
+
+            if renewed:
+                heartbeat_observed.set()
+
+            return renewed
+
+        monkeypatch.setattr(
+            scan_service,
+            "update_scan_heartbeat",
+            observed_heartbeat,
+        )
+
+        # Keep the scanner running until a heartbeat is received.
+        def slow_scanner(self, target_url):
+            assert heartbeat_observed.wait(timeout=3), (
+                "Heartbeat was not received while scanner was running"
+            )
+
+            return ScannerResult(
+                scanner_name="HTTPScanner",
+                target=target_url,
+                success=True,
+            )
+
+        monkeypatch.setattr(
+            scan_service.HTTPScanner,
+            "execute",
+            slow_scanner,
+        )
+
+        # Execute using independent database sessions.
+        with TestSessionLocal() as db:
+            result = scan_service.process_next_scan(
+                db,
+                heartbeat_session_factory=TestSessionLocal,
+            )
+
+            assert result is not None
+            assert result.id == scan_id
+            assert result.status == "completed"
+
+        # Confirm the heartbeat was actually recorded in the database.
+        with TestSessionLocal() as db:
+            completed_scan = db.get(Scan, scan_id)
+
+            assert completed_scan is not None
+            assert completed_scan.last_heartbeat_at is not None
+            assert completed_scan.lease_expires_at is None
+            assert completed_scan.status == "completed"
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+def test_worker_does_not_complete_scan_after_heartbeat_failure(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import threading
+
+    from sqlalchemy import create_engine, select, func
+    from sqlalchemy.orm import sessionmaker
+
+    import app.services.scan_service as scan_service
+
+    from app.core.database import Base
+    from app.models.user import User
+    from app.models.project import Project
+    from app.models.target import Target
+    from app.models.authorization import AuthorizationRequest
+    from app.models.scan import Scan
+    from app.models.finding import Finding
+    from app.scanners.heartbeat import ScanHeartbeatKeeper
+    from app.scanners.base import ScannerResult, ScanFinding
+
+    database_path = tmp_path / "heartbeat_failure_test.db"
+
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False},
+    )
+
+    TestSessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+
+    Base.metadata.create_all(bind=engine)
+
+    heartbeat_attempted = threading.Event()
+
+    try:
+        # Create valid scan records.
+        with TestSessionLocal() as db:
+            user = User(
+                email="heartbeat-failure@example.com",
+                password_hash="test-hash",
+                role="user",
+                is_active=True,
+            )
+            db.add(user)
+            db.flush()
+
+            project = Project(
+                owner_id=user.id,
+                name="Heartbeat Failure Test",
+            )
+            db.add(project)
+            db.flush()
+
+            target = Target(
+                project_id=project.id,
+                value="heartbeat-failure.example.com",
+                target_type="domain",
+                authorization_status="approved",
+            )
+            db.add(target)
+            db.flush()
+
+            authorization = AuthorizationRequest(
+                target_id=target.id,
+                status="approved",
+                evidence_reference="heartbeat-failure-authorization",
+                requested_scope=json.dumps([target.value]),
+                requested_by="test-requester",
+            )
+            db.add(authorization)
+            db.flush()
+
+            scan = Scan(
+                target_id=target.id,
+                authorization_request_id=authorization.id,
+                requested_by=user.id,
+                scan_type="web",
+                status="queued",
+            )
+            db.add(scan)
+            db.commit()
+
+            scan_id = scan.id
+
+        # Use the real heartbeat keeper with a short interval.
+        def fast_keeper(**kwargs):
+            kwargs["heartbeat_interval"] = 0.05
+            return ScanHeartbeatKeeper(**kwargs)
+
+        monkeypatch.setattr(
+            scan_service,
+            "ScanHeartbeatKeeper",
+            fast_keeper,
+        )
+
+        # Simulate rejection of heartbeat renewal.
+        def rejected_heartbeat(
+            db,
+            scan_id,
+            worker_id,
+            lease_seconds,
+        ):
+            heartbeat_attempted.set()
+            return False
+
+        monkeypatch.setattr(
+            scan_service,
+            "update_scan_heartbeat",
+            rejected_heartbeat,
+        )
+
+        # Return a finding after the heartbeat attempt.
+        def slow_scanner(self, target_url):
+            assert heartbeat_attempted.wait(timeout=3), (
+                "Heartbeat was not attempted during scanner execution"
+            )
+
+            return ScannerResult(
+                scanner_name="HTTPScanner",
+                target=target_url,
+                success=True,
+                findings=(
+                    ScanFinding(
+                        title="Test finding",
+                        severity="high",
+                        description="Integration test finding",
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(
+            scan_service.HTTPScanner,
+            "execute",
+            slow_scanner,
+        )
+
+        # A lost lease must prevent scan completion.
+        from app.services.scan_service import ScanLifecycleError
+
+        with TestSessionLocal() as db:
+            with pytest.raises(ScanLifecycleError):
+                scan_service.process_next_scan(
+                    db,
+                    heartbeat_session_factory=TestSessionLocal,
+                )
+
+        # Verify that no findings were committed.
+        with TestSessionLocal() as db:
+            completed_scan = db.get(Scan, scan_id)
+
+            assert completed_scan is not None
+            assert completed_scan.status == "running"
+            assert completed_scan.worker_id is not None
+
+            finding_count = db.scalar(
+                select(func.count())
+                .select_from(Finding)
+                .where(Finding.scan_id == scan_id)
+            )
+
+            assert finding_count == 0
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+        
+def test_worker_cannot_complete_scan_after_ownership_takeover(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import threading
+    import time
+
+    from sqlalchemy import create_engine, select, func, update
+    from sqlalchemy.orm import sessionmaker
+
+    import app.services.scan_service as scan_service
+
+    from app.core.database import Base
+    from app.models.user import User
+    from app.models.project import Project
+    from app.models.target import Target
+    from app.models.authorization import AuthorizationRequest
+    from app.models.scan import Scan
+    from app.models.finding import Finding
+    from app.scanners.heartbeat import ScanHeartbeatKeeper
+    from app.scanners.base import ScannerResult, ScanFinding
+    from app.services.scan_service import ScanLifecycleError
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'ownership_test.db'}",
+        connect_args={"check_same_thread": False},
+    )
+
+    TestSessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+
+    Base.metadata.create_all(bind=engine)
+
+    heartbeat_attempted = threading.Event()
+    keepers = []
+
+    try:
+        with TestSessionLocal() as db:
+            user = User(
+                email="ownership-test@example.com",
+                password_hash="test-hash",
+                role="user",
+                is_active=True,
+            )
+            db.add(user)
+            db.flush()
+
+            project = Project(
+                owner_id=user.id,
+                name="Ownership Takeover Test",
+            )
+            db.add(project)
+            db.flush()
+
+            target = Target(
+                project_id=project.id,
+                value="ownership-test.example.com",
+                target_type="domain",
+                authorization_status="approved",
+            )
+            db.add(target)
+            db.flush()
+
+            authorization = AuthorizationRequest(
+                target_id=target.id,
+                status="approved",
+                evidence_reference="ownership-test-authorization",
+                requested_scope=json.dumps([target.value]),
+                requested_by="test-requester",
+            )
+            db.add(authorization)
+            db.flush()
+
+            scan = Scan(
+                target_id=target.id,
+                authorization_request_id=authorization.id,
+                requested_by=user.id,
+                scan_type="web",
+                status="queued",
+            )
+            db.add(scan)
+            db.commit()
+
+            scan_id = scan.id
+
+        # Use the real keeper with a short heartbeat interval.
+        def fast_keeper(**kwargs):
+            kwargs["heartbeat_interval"] = 0.05
+
+            keeper = ScanHeartbeatKeeper(**kwargs)
+            keepers.append(keeper)
+
+            return keeper
+
+        monkeypatch.setattr(
+            scan_service,
+            "ScanHeartbeatKeeper",
+            fast_keeper,
+        )
+
+        original_update = scan_service.update_scan_heartbeat
+
+        # Simulate another worker taking ownership before renewal.
+        def takeover_then_heartbeat(
+            db,
+            scan_id,
+            worker_id,
+            lease_seconds,
+        ):
+            db.execute(
+                update(Scan)
+                .where(Scan.id == scan_id)
+                .values(worker_id="replacement-worker")
+            )
+            db.commit()
+
+            renewed = original_update(
+                db,
+                scan_id,
+                worker_id,
+                lease_seconds,
+            )
+
+            heartbeat_attempted.set()
+
+            return renewed
+
+        monkeypatch.setattr(
+            scan_service,
+            "update_scan_heartbeat",
+            takeover_then_heartbeat,
+        )
+
+        def slow_scanner(self, target_url):
+            assert heartbeat_attempted.wait(timeout=3)
+
+            # Wait until the keeper has recorded lease loss.
+            deadline = time.monotonic() + 2
+
+            while time.monotonic() < deadline:
+                if keepers and keepers[0].lease_lost:
+                    break
+                time.sleep(0.01)
+
+            assert keepers[0].lease_lost
+
+            return ScannerResult(
+                scanner_name="HTTPScanner",
+                target=target_url,
+                success=True,
+                findings=(
+                    ScanFinding(
+                        title="Ownership test finding",
+                        severity="high",
+                        description="Must not be persisted.",
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(
+            scan_service.HTTPScanner,
+            "execute",
+            slow_scanner,
+        )
+
+        with TestSessionLocal() as db:
+            with pytest.raises(ScanLifecycleError):
+                scan_service.process_next_scan(
+                    db,
+                    heartbeat_session_factory=TestSessionLocal,
+                )
+
+        # Verify that the original worker did not complete the scan.
+        with TestSessionLocal() as db:
+            stored_scan = db.get(Scan, scan_id)
+
+            assert stored_scan is not None
+            assert stored_scan.status == "running"
+            assert stored_scan.worker_id == "replacement-worker"
+
+            finding_count = db.scalar(
+                select(func.count())
+                .select_from(Finding)
+                .where(Finding.scan_id == scan_id)
+            )
+
+            assert finding_count == 0
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
