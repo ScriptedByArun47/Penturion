@@ -1265,3 +1265,174 @@ def test_worker_cannot_complete_scan_after_ownership_takeover(
     finally:
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
+
+def test_worker_cancels_running_scan_without_persisting_findings(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import threading
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import app.services.scan_service as scan_service
+
+    from app.core.database import Base
+    from app.models.user import User
+    from app.models.project import Project
+    from app.models.target import Target
+    from app.models.authorization import AuthorizationRequest
+    from app.models.scan import Scan
+    from app.models.finding import Finding
+    from app.scanners.heartbeat import ScanHeartbeatKeeper
+    from app.scanners.base import ScanFinding, ScannerResult
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'cancellation_test.db'}",
+        connect_args={"check_same_thread": False},
+    )
+
+    TestSessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+
+    Base.metadata.create_all(bind=engine)
+
+    cancellation_observed = threading.Event()
+
+    try:
+        with TestSessionLocal() as db:
+            user = User(
+                email="cancellation-test@example.com",
+                password_hash="test-hash",
+                role="user",
+                is_active=True,
+            )
+            db.add(user)
+            db.flush()
+
+            user_id = user.id
+
+            project = Project(
+                owner_id=user.id,
+                name="Cancellation Integration Test",
+            )
+            db.add(project)
+            db.flush()
+
+            target = Target(
+                project_id=project.id,
+                value="cancellation-test.example.com",
+                target_type="domain",
+                authorization_status="approved",
+            )
+            db.add(target)
+            db.flush()
+
+            authorization = AuthorizationRequest(
+                target_id=target.id,
+                status="approved",
+                evidence_reference="cancellation-test-authorization",
+                requested_scope=json.dumps([target.value]),
+                requested_by="test-requester",
+            )
+            db.add(authorization)
+            db.flush()
+
+            scan = Scan(
+                target_id=target.id,
+                authorization_request_id=authorization.id,
+                requested_by=user.id,
+                scan_type="web",
+                status="queued",
+            )
+            db.add(scan)
+            db.commit()
+
+            scan_id = scan.id
+
+        def fast_keeper(**kwargs):
+            kwargs["heartbeat_interval"] = 0.05
+            return ScanHeartbeatKeeper(**kwargs)
+
+        monkeypatch.setattr(
+            scan_service,
+            "ScanHeartbeatKeeper",
+            fast_keeper,
+        )
+
+        def scanner_with_cancellation(self, target_url):
+            # Simulate cancellation from another API request.
+            with TestSessionLocal() as cancel_db:
+                requested = scan_service.request_scan_cancellation(
+                    db=cancel_db,
+                    scan_id=scan_id,
+                    owner_id=user_id,
+                )
+
+                assert requested.status == "running"
+                assert requested.cancel_requested_at is not None
+
+            # Wait until the heartbeat keeper detects cancellation.
+            assert self.cancel_event.wait(timeout=3), (
+                "Worker did not detect the cancellation request"
+            )
+
+            cancellation_observed.set()
+
+            # Return a finding deliberately. It must not be persisted.
+            return ScannerResult(
+                scanner_name="HTTPScanner",
+                target=target_url,
+                success=True,
+                findings=(
+                    ScanFinding(
+                        title="Cancellation test finding",
+                        severity="low",
+                        description="Test finding.",
+                        evidence={"test": True},
+                        remediation="Test remediation.",
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(
+            scan_service.HTTPScanner,
+            "execute",
+            scanner_with_cancellation,
+        )
+
+        with TestSessionLocal() as db:
+            result = scan_service.process_next_scan(
+                db,
+                heartbeat_session_factory=TestSessionLocal,
+            )
+
+            assert result is not None
+            assert result.id == scan_id
+            assert result.status == "cancelled"
+
+        assert cancellation_observed.is_set()
+
+        with TestSessionLocal() as db:
+            cancelled_scan = db.get(Scan, scan_id)
+
+            assert cancelled_scan.status == "cancelled"
+            assert cancelled_scan.cancel_requested_at is not None
+            assert cancelled_scan.worker_id is None
+            assert cancelled_scan.lease_expires_at is None
+
+            findings = (
+                db.query(Finding)
+                .filter(Finding.scan_id == scan_id)
+                .all()
+            )
+
+            assert findings == []
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()

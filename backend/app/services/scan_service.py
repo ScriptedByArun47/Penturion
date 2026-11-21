@@ -39,15 +39,19 @@ from app.services.authorization_scope import (
 
 
 ALLOWED_SCAN_TRANSITIONS = {
-    "queued": {"running", "failed"},
-    "running": {"completed", "failed"},
+    "queued": {"running", "failed", "cancelled"},
+    "running": {"completed", "failed", "cancelled"},
     "completed": set(),
     "failed": set(),
+    "cancelled": set(),
 }
 
 class ScanLifecycleError(Exception):
     """Raised when a scan lifecycle transition is invalid."""
-    
+
+class ScanCancellationRequested(ScanLifecycleError):
+    """Raised when cancellation wins the scan completion race."""
+
 class ScanAuthorizationError(Exception):
     """Raised when a scan request is not authorized."""
 def validate_approved_scope(
@@ -342,6 +346,110 @@ def get_scan(
 
     return db.scalars(statement).first()
 
+def request_scan_cancellation(
+    db: Session,
+    scan_id: str,
+    owner_id: str,
+) -> Scan | None:
+    """Request cancellation of an owned scan."""
+
+    scan = get_scan(
+        db=db,
+        scan_id=scan_id,
+        owner_id=owner_id,
+    )
+
+    if scan is None:
+        return None
+
+    if scan.status == "cancelled":
+        return scan
+
+    if (scan.status == "running" and scan.cancel_requested_at is not None):
+        return scan
+
+    if scan.status in {"completed", "failed"}:
+        raise ScanLifecycleError( f"Cannot cancel a scan with status '{scan.status}'")
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        if scan.status == "queued":
+            statement = (
+                update(Scan)
+                .where(
+                    Scan.id == scan_id,
+                    Scan.requested_by == owner_id,
+                    Scan.status == "queued",
+                )
+                .values(
+                    status="cancelled",
+                    cancel_requested_at=now,
+                    completed_at=now,
+                    error_message=None,
+                )
+            )
+        elif scan.status == "running":
+            statement = (
+                update(Scan)
+                .where(
+                    Scan.id == scan_id,
+                    Scan.requested_by == owner_id,
+                    Scan.status == "running",
+                    Scan.cancel_requested_at.is_(None),
+                )
+                .values(cancel_requested_at=now)
+            )
+        else:
+            raise ScanLifecycleError(
+                f"Cannot cancel a scan with status '{scan.status}'"
+            )
+
+        result = db.execute(
+            statement.execution_options(synchronize_session=False)
+        )
+
+        if result.rowcount != 1:
+            db.rollback()
+
+            # Another request may have cancelled it concurrently.
+            current_scan = get_scan(
+                db=db,
+                scan_id=scan_id,
+                owner_id=owner_id,
+            )
+
+            if current_scan is not None:
+                if current_scan.status == "cancelled":
+                    return current_scan
+
+                if (
+                    current_scan.status == "running"
+                    and current_scan.cancel_requested_at is not None
+                ):
+                    return current_scan
+
+
+
+            raise ScanLifecycleError(
+                "Scan state changed while cancellation was requested"
+            )
+
+        db.commit()
+        db.expire_all()
+
+        updated_scan = get_scan(
+            db=db,
+            scan_id=scan_id,
+            owner_id=owner_id,
+        )
+
+        return updated_scan
+
+    except Exception:
+        db.rollback()
+        raise
+
 def claim_next_scan(
     db: Session,
     worker_id: str | None = None,
@@ -404,7 +512,7 @@ def claim_next_scan(
     except Exception:
         db.rollback()
         raise
-    
+
 
 def transition_scan(
     db: Session,
@@ -576,11 +684,12 @@ def process_next_scan(
         db.rollback()
 
         session_factory = heartbeat_session_factory or SessionLocal
-        
+
         # 4. Start independent background heartbeat management.
         keeper = ScanHeartbeatKeeper(
             session_factory=session_factory,
             heartbeat_callback=update_scan_heartbeat,
+            cancellation_callback=check_scan_cancellation,
             scan_id=scan_id,
             worker_id=worker_id,
             lease_seconds=60,
@@ -615,11 +724,18 @@ def process_next_scan(
                 keeper.failure_reason or "Worker lease was lost"
             )
 
+        if keeper.cancellation_requested:
+            return cancel_running_scan(
+                db=db,
+                scan_id=scan_id,
+                worker_id=worker_id,
+            )
+
         if scanner_error is not None:
             raise scanner_error
 
-        
-        
+
+
 
         # Check the current lease again. This also protects short scans
         # that finish before the first periodic heartbeat.
@@ -693,6 +809,14 @@ def process_next_scan(
             worker_id=worker_id,
         )
 
+    except ScanCancellationRequested:
+        db.rollback()
+
+        return cancel_running_scan(
+            db=db,
+            scan_id=scan_id,
+            worker_id=worker_id,
+        )
     except ScanLifecycleError:
         db.rollback()
         raise
@@ -792,6 +916,7 @@ def complete_running_scan(
                 Scan.status == "running",
                 Scan.worker_id == worker_id,
                 Scan.lease_expires_at > now,
+                Scan.cancel_requested_at.is_(None),
             )
             .values(
                 status="completed",
@@ -804,6 +929,20 @@ def complete_running_scan(
         )
 
         if result.rowcount != 1:
+            cancellation_requested = db.scalar(
+                select(Scan.cancel_requested_at).where(
+                    Scan.id == scan_id,
+                    Scan.status == "running",
+                    Scan.worker_id == worker_id,
+                    Scan.lease_expires_at > now,
+                )
+            )
+
+            if cancellation_requested is not None:
+                raise ScanCancellationRequested(
+                    "Scan cancellation was requested before completion"
+                )
+
             raise ScanLifecycleError(
                 "Could not complete scan: worker ownership or lease is invalid"
             )
@@ -823,7 +962,60 @@ def complete_running_scan(
     except Exception:
         db.rollback()
         raise
-    
+def cancel_running_scan(
+    db: Session,
+    scan_id: str,
+    worker_id: str,
+) -> Scan:
+    """Finalize cancellation when the current worker owns a valid lease."""
+
+    if not worker_id.strip() or len(worker_id) > 100:
+        raise ValueError("worker_id must contain 1-100 characters")
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        result = db.execute(
+            update(Scan)
+            .where(
+                Scan.id == scan_id,
+                Scan.status == "running",
+                Scan.worker_id == worker_id,
+                Scan.lease_expires_at > now,
+                Scan.cancel_requested_at.is_not(None),
+            )
+            .values(
+                status="cancelled",
+                completed_at=now,
+                error_message=None,
+                worker_id=None,
+                lease_expires_at=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+        if result.rowcount != 1:
+            raise ScanLifecycleError(
+                "Could not cancel scan: worker ownership, lease, "
+                "or cancellation request is invalid"
+            )
+
+        db.commit()
+        db.expire_all()
+
+        scan = db.get(Scan, scan_id)
+
+        if scan is None:
+            raise ScanLifecycleError(
+                "Scan could not be retrieved after cancellation"
+            )
+
+        return scan
+
+    except Exception:
+        db.rollback()
+        raise
+
 def recover_abandoned_scans(
     db: Session,
     timeout_minutes: int = 30,
@@ -923,6 +1115,34 @@ def update_scan_heartbeat(
         db.commit()
         db.expire_all()
         return True
+
+    except Exception:
+        db.rollback()
+        raise
+
+def check_scan_cancellation(
+    db: Session,
+    scan_id: str,
+    worker_id: str,
+) -> bool:
+    """Check cancellation for the current worker with a valid lease."""
+
+    if not worker_id.strip() or len(worker_id) > 100:
+        raise ValueError("worker_id must contain 1-100 characters")
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        cancel_requested_at = db.scalar(
+            select(Scan.cancel_requested_at).where(
+                Scan.id == scan_id,
+                Scan.status == "running",
+                Scan.worker_id == worker_id,
+                Scan.lease_expires_at > now,
+            )
+        )
+
+        return cancel_requested_at is not None
 
     except Exception:
         db.rollback()

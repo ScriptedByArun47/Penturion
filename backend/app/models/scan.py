@@ -32,12 +32,12 @@ class Scan(Base):
     )
 
     authorization_request_id: Mapped[str | None] = mapped_column(
-    String(36),
-    ForeignKey("authorization_requests.id", ondelete="RESTRICT"),
-    nullable=True,
-    index=True,
+        String(36),
+        ForeignKey("authorization_requests.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
     )
-    
+
     requested_by: Mapped[str] = mapped_column(
         String(36),
         ForeignKey("users.id", ondelete="RESTRICT"),
@@ -73,12 +73,12 @@ class Scan(Base):
         DateTime(timezone=True),
         nullable=True,
     )
-    
+
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(
-    DateTime(timezone=True),
-    nullable=True,
+        DateTime(timezone=True),
+        nullable=True,
     )
-    
+
     worker_id: Mapped[str | None] = mapped_column(
         String(100),
         nullable=True,
@@ -90,8 +90,13 @@ class Scan(Base):
         nullable=True,
         index=True,
     )
-    
+
     completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )

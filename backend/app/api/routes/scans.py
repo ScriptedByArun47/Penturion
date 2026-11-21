@@ -9,9 +9,11 @@ from app.models.user import User
 from app.schemas.scan import ScanCreate, ScanResponse
 from app.services.scan_service import (
     ScanAuthorizationError,
+    ScanLifecycleError,
     create_scan,
     get_scan,
     list_scans,
+    request_scan_cancellation,
 )
 
 
@@ -88,4 +90,37 @@ def create_new_scan(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Target not found",
+        ) from exc
+
+@router.post(
+    "/{scan_id}/cancel",
+    response_model=ScanResponse,
+    status_code=status.HTTP_200_OK,
+)
+def cancel_scan(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Request cancellation of an owned scan."""
+
+    try:
+        scan = request_scan_cancellation(
+            db=db,
+            scan_id=scan_id,
+            owner_id=current_user.id,
+        )
+
+        if scan is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Scan not found",
+            )
+
+        return scan
+
+    except ScanLifecycleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
         ) from exc

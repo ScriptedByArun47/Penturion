@@ -166,3 +166,29 @@ def test_cannot_start_twice():
         keeper.start()
 
     assert keeper.stop(timeout=2) is True
+
+def test_cancellation_request_signals_scanner_without_losing_lease():
+    cancel_event = threading.Event()
+
+    def heartbeat_callback(db, scan_id, worker_id, lease_seconds):
+        return True
+
+    def cancellation_callback(db, scan_id, worker_id):
+        return True
+
+    keeper, session = make_keeper(
+        heartbeat_callback,
+        cancel_event=cancel_event,
+        heartbeat_interval=0.01,
+    )
+
+    keeper._cancellation_callback = cancellation_callback
+
+    keeper.start()
+
+    assert cancel_event.wait(timeout=2)
+    assert keeper.stop(timeout=2) is True
+
+    assert keeper.cancellation_requested is True
+    assert keeper.lease_lost is False
+    assert session.closed is True

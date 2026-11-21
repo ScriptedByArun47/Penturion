@@ -9,7 +9,12 @@ from app.models.scan import Scan
 from app.models.target import Target
 from app.models.user import User
 from app.services.scan_service import (
+    ScanCancellationRequested,
     ScanLifecycleError,
+    cancel_running_scan,
+    claim_next_scan,
+    complete_running_scan,
+    request_scan_cancellation,
     transition_scan,
 )
 
@@ -238,7 +243,7 @@ def test_unsupported_status_is_rejected(auth_client, target_id):
             match="Unsupported scan status",
         ):
             transition_scan(
-                db, scan_id, owner_id, "cancelled"
+                db, scan_id, owner_id, "paused"
             )
     finally:
         db_generator.close()
@@ -307,5 +312,168 @@ def test_stale_transition_cannot_overwrite_current_status(
         assert current_scan is not None
         assert current_scan.status == "running"
 
+    finally:
+        db_generator.close()
+
+def test_queued_scan_can_be_cancelled(auth_client, target_id):
+    scan_id = create_queued_scan(auth_client, target_id)
+    owner_id = get_user_id(
+        auth_client, "targets-reviewer@example.com"
+    )
+
+    db_generator, db = get_test_db(auth_client)
+    try:
+        scan = request_scan_cancellation(db, scan_id, owner_id)
+
+        assert scan is not None
+        assert scan.status == "cancelled"
+        assert scan.cancel_requested_at is not None
+        assert scan.completed_at is not None
+        assert scan.worker_id is None
+    finally:
+        db_generator.close()
+
+
+def test_running_scan_cancellation_is_requested(auth_client, target_id):
+    scan_id = create_queued_scan(auth_client, target_id)
+    owner_id = get_user_id(
+        auth_client, "targets-reviewer@example.com"
+    )
+
+    db_generator, db = get_test_db(auth_client)
+    try:
+        running = claim_next_scan(db, worker_id="test-worker")
+        assert running is not None
+        assert running.id == scan_id
+        assert running.status == "running"
+
+        original_lease = running.lease_expires_at
+
+        scan = request_scan_cancellation(db, scan_id, owner_id)
+
+        assert scan is not None
+        assert scan.status == "running"
+        assert scan.cancel_requested_at is not None
+        assert scan.worker_id == "test-worker"
+        assert scan.lease_expires_at == original_lease
+    finally:
+        db_generator.close()
+def test_repeated_running_cancellation_is_idempotent(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+    owner_id = get_user_id(
+        auth_client, "targets-reviewer@example.com"
+    )
+
+    db_generator, db = get_test_db(auth_client)
+    try:
+        claim_next_scan(db, worker_id="test-worker")
+
+        first = request_scan_cancellation(db, scan_id, owner_id)
+        first_timestamp = first.cancel_requested_at
+
+        second = request_scan_cancellation(db, scan_id, owner_id)
+
+        assert second.status == "running"
+        assert second.cancel_requested_at == first_timestamp
+    finally:
+        db_generator.close()
+
+
+def test_worker_can_finalize_requested_cancellation(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+    owner_id = get_user_id(
+        auth_client, "targets-reviewer@example.com"
+    )
+
+    db_generator, db = get_test_db(auth_client)
+    try:
+        claim_next_scan(db, worker_id="test-worker")
+        request_scan_cancellation(db, scan_id, owner_id)
+
+        cancelled = cancel_running_scan(
+            db, scan_id, "test-worker"
+        )
+
+        assert cancelled.status == "cancelled"
+        assert cancelled.cancel_requested_at is not None
+        assert cancelled.completed_at is not None
+        assert cancelled.worker_id is None
+        assert cancelled.lease_expires_at is None
+    finally:
+        db_generator.close()
+
+def test_other_worker_cannot_finalize_cancellation(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+    owner_id = get_user_id(
+        auth_client, "targets-reviewer@example.com"
+    )
+
+    db_generator, db = get_test_db(auth_client)
+    try:
+        claim_next_scan(db, worker_id="worker-one")
+        request_scan_cancellation(db, scan_id, owner_id)
+
+        with pytest.raises(
+            ScanLifecycleError,
+            match="worker ownership",
+        ):
+            cancel_running_scan(db, scan_id, "worker-two")
+
+        scan = db.get(Scan, scan_id)
+        assert scan.status == "running"
+        assert scan.cancel_requested_at is not None
+    finally:
+        db_generator.close()
+
+
+def test_worker_cannot_cancel_without_request(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+    try:
+        claim_next_scan(db, worker_id="test-worker")
+
+        with pytest.raises(
+            ScanLifecycleError,
+            match="cancellation request",
+        ):
+            cancel_running_scan(db, scan_id, "test-worker")
+
+        scan = db.get(Scan, scan_id)
+        assert scan.status == "running"
+        assert scan.cancel_requested_at is None
+    finally:
+        db_generator.close()
+
+def test_worker_cannot_complete_after_cancellation_request(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+    owner_id = get_user_id(
+        auth_client, "targets-reviewer@example.com"
+    )
+
+    db_generator, db = get_test_db(auth_client)
+    try:
+        claim_next_scan(db, worker_id="test-worker")
+        request_scan_cancellation(db, scan_id, owner_id)
+
+        with pytest.raises(
+            ScanCancellationRequested,
+            match="cancellation was requested",
+        ):
+            complete_running_scan(db, scan_id, "test-worker")
+
+        scan = db.get(Scan, scan_id)
+        assert scan.status == "running"
+        assert scan.cancel_requested_at is not None
     finally:
         db_generator.close()

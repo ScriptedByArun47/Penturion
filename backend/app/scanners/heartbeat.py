@@ -15,6 +15,11 @@ HeartbeatCallback = Callable[
     bool,
 ]
 
+CancellationCallback = Callable[
+    [Session, str, str],
+    bool,
+]
+
 
 class ScanHeartbeatKeeper:
     """Renew a scan lease using independent database sessions."""
@@ -28,6 +33,7 @@ class ScanHeartbeatKeeper:
         lease_seconds: int = 60,
         heartbeat_interval: int = 20,
         cancel_event: threading.Event | None = None,
+        cancellation_callback: CancellationCallback | None = None,
     ) -> None:
         if not callable(session_factory):
             raise TypeError("session_factory must be callable")
@@ -60,6 +66,8 @@ class ScanHeartbeatKeeper:
         self._heartbeat_interval = heartbeat_interval
 
         self.cancel_event = cancel_event or threading.Event()
+        self._cancellation_callback = cancellation_callback
+        self._cancellation_requested = False
 
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()
@@ -78,6 +86,11 @@ class ScanHeartbeatKeeper:
     def failure_reason(self) -> str | None:
         with self._state_lock:
             return self._failure_reason
+
+    @property
+    def cancellation_requested(self) -> bool:
+        with self._state_lock:
+            return self._cancellation_requested
 
     def start(self) -> None:
         """Start the background heartbeat thread."""
@@ -128,11 +141,12 @@ class ScanHeartbeatKeeper:
         )
 
     def _renew_lease(self) -> bool:
-        """Renew the lease using a separate database session."""
+        """Renew the lease and check for a cancellation request."""
 
         db: Session | None = None
         renewed = False
         failure_reason: str | None = None
+        cancellation_requested = False
 
         try:
             db = self._session_factory()
@@ -147,6 +161,12 @@ class ScanHeartbeatKeeper:
             if not renewed:
                 failure_reason = (
                     "Heartbeat rejected: worker no longer owns a valid lease"
+                )
+            elif self._cancellation_callback is not None:
+                cancellation_requested = self._cancellation_callback(
+                    db,
+                    self._scan_id,
+                    self._worker_id,
                 )
 
         except Exception as exc:
@@ -167,6 +187,13 @@ class ScanHeartbeatKeeper:
         if failure_reason is not None:
             self._mark_lease_lost(failure_reason)
             return False
+
+        if cancellation_requested:
+            with self._state_lock:
+                self._cancellation_requested = True
+
+            self.cancel_event.set()
+            return True
 
         return renewed
 

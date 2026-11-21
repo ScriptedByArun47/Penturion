@@ -28,3 +28,4 @@ class ScanResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+    cancel_requested_at: datetime | None
