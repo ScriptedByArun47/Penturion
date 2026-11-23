@@ -111,3 +111,11 @@ class Scan(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+
+
+    discovered_assets: Mapped[list["DiscoveredAsset"]] = relationship(
+        "DiscoveredAsset",
+        back_populates="scan",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )

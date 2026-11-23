@@ -101,3 +101,37 @@ def test_expired_authorization_blocks_execution(
 
     finally:
         db_generator.close()
+        
+def test_narrow_domain_scope_passes_execution_authorization(
+    auth_client, target_id
+):
+    import json
+    from app.models.scan import Scan
+
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        claimed = claim_next_scan(db)
+        assert claimed is not None
+        assert claimed.id == scan_id
+
+        scan = db.get(Scan, scan_id)
+        assert scan is not None
+
+        root_domain = scan.target.value
+        narrow_scope = f"api.{root_domain}"
+
+        scan.authorization_request.requested_scope = json.dumps(
+            [narrow_scope]
+        )
+        db.commit()
+
+        validated = validate_scan_for_execution(db, scan_id)
+
+        assert validated is not None
+        assert validated.status == "running"
+
+    finally:
+        db_generator.close()

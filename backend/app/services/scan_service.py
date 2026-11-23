@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.models.project import Project
 from app.models.scan import Scan
 from app.models.target import Target
+from app.scanners.base import ScannerResult
 
 import ipaddress
 import json
@@ -24,6 +25,13 @@ from app.scanners.heartbeat import ScanHeartbeatKeeper
 
 from app.models.finding import Finding
 from app.scanners.adapters.http_scanner import HTTPScanner
+from app.scanners.recon.crtsh_provider import CrtShSubdomainProvider
+
+from app.scanners.agent_context import AgentExecutionContext
+from app.scanners.executor import AgentExecutionCancelled
+from app.scanners.recon.subdomain_discovery import SubdomainDiscoveryAgent
+from app.services.discovered_asset_service import persist_discovered_assets
+
 
 from app.models.authorization import AuthorizationRequest
 from app.scanners.scope import (
@@ -96,12 +104,10 @@ def validate_approved_scope(
         entries = json.loads(canonical_scope)
 
         if target.target_type == "domain":
-            target_hostname = normalize_hostname(target.value)
-
-            covered = any(
-                host_matches_domain(target_hostname, entry)
-                for entry in entries
-            )
+            # Every entry has already been validated as belonging
+            # to the registered root domain.
+            # Narrow scopes are valid even when the root is not included.
+            covered = bool(entries)
 
         elif target.target_type == "ip":
             target_ip = ipaddress.ip_address(target.value)
@@ -274,6 +280,7 @@ def validate_scan_for_execution(
         raise
 
     return scan
+
 
 
 
@@ -611,6 +618,19 @@ def transition_scan(
         db.rollback()
         raise
 
+
+class _NoopRequestLimiter:
+    def acquire(self, host: str, timeout: float | None = None) -> bool:
+        return True
+
+    def release(self, host: str) -> None:
+        pass
+    
+def create_subdomain_discovery_provider():
+    """Create the production passive subdomain discovery provider."""
+    return CrtShSubdomainProvider()
+
+
 def process_next_scan(
     db: Session,
     heartbeat_session_factory: Callable[[], Session] | None = None,
@@ -649,6 +669,26 @@ def process_next_scan(
         # Capture target information before ending the read transaction.
         target_type = target.target_type
         target_value = target.value
+        
+        root_domain = None
+        root_domain_approved = False
+
+        if target_type == "domain":
+            root_domain = normalize_hostname(target_value)
+
+            authorization = validated_scan.authorization_request
+
+            canonical_scope = validate_authorization_scope(
+                authorization.requested_scope,
+                target_value,
+                target_type,
+            )
+
+            approved_entries = json.loads(canonical_scope)
+
+            # Exact equality is intentional: a subdomain approval
+            # must not authorize scanning the registered root.
+            root_domain_approved = root_domain in approved_entries
 
         # 2. Build the scanner input.
         if target_type == "url":
@@ -699,11 +739,63 @@ def process_next_scan(
         keeper.start()
 
         # 5. Execute the HTTP scanner and stop heartbeat management.
+                # 5. Run passive A01 discovery before active HTTP scanning.
         scanner_error = None
         result = None
 
         try:
-            result = HTTPScanner(
+            if target_type == "domain":
+                context = AgentExecutionContext(
+                    scan_id=scan_id,
+                    target=root_domain,
+                    target_type="domain",
+                    authorized_value=root_domain,
+                    timeout_seconds=120,
+                    cancel_event=keeper.cancel_event,
+                    request_limiter=_NoopRequestLimiter(),
+                )
+
+                discovery_result = SubdomainDiscoveryAgent(
+                    create_subdomain_discovery_provider()
+                ).execute(context)
+
+                if not discovery_result.success:
+                    result = ScannerResult(
+                        scanner_name="A01",
+                        target=scan_url,
+                        success=False,
+                        error=discovery_result.error,
+                    )
+                else:
+                    # Persist discoveries with independent scope validation.
+                    persist_discovered_assets(
+                        db=db,
+                        scan_id=scan_id,
+                        worker_id=worker_id,
+                        hostnames=[
+                            candidate.value
+                            for candidate in discovery_result.asset_candidates
+                        ],
+                    )
+                    db.commit()
+
+                    if root_domain_approved:
+                        # Root is explicitly approved for active testing.
+                        result = HTTPScanner(
+                            cancel_event=keeper.cancel_event
+                        ).execute(scan_url)
+                    else:
+                        # Narrow scope: never actively scan the root.
+                        result = ScannerResult(
+                            scanner_name="A01",
+                            target=scan_url,
+                            success=True,
+                            findings=(),
+                        )
+
+            else:
+                # Preserve existing URL-target scanning.
+                result = HTTPScanner(
                     cancel_event=keeper.cancel_event
                 ).execute(scan_url)
 

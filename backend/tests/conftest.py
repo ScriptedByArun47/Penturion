@@ -115,3 +115,33 @@ def target_id(auth_client, project_id):
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+class MockSubdomainDiscoveryProvider:
+    def discover(
+        self,
+        *,
+        root_domain,
+        timeout_seconds,
+        cancel_event,
+    ):
+        if cancel_event.is_set():
+            from app.scanners.executor import AgentExecutionCancelled
+
+            raise AgentExecutionCancelled("Discovery cancelled")
+
+        return [
+            f"api.{root_domain}",
+            f"www.{root_domain}",
+        ]
+
+
+@pytest.fixture(autouse=True)
+def mock_subdomain_discovery_provider(monkeypatch):
+    from app.services import scan_service
+
+    monkeypatch.setattr(
+        scan_service,
+        "create_subdomain_discovery_provider",
+        MockSubdomainDiscoveryProvider,
+    )
