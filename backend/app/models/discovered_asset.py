@@ -82,3 +82,10 @@ class DiscoveredAsset(Base):
         "Scan",
         back_populates="discovered_assets",
     )
+    
+    dns_records: Mapped[list["DNSRecord"]] = relationship(
+        "DNSRecord",
+        back_populates="discovered_asset",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )

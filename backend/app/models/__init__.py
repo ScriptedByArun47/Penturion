@@ -9,6 +9,7 @@ from app.models.user import User
 from app.models.finding import Finding
 from app.models.agent_execution import AgentExecution
 from app.models.discovered_asset import DiscoveredAsset
+from app.models.dns_record import DNSRecord
 
 __all__ = [
     "Base",
@@ -20,4 +21,5 @@ __all__ = [
     "Finding",
     "AgentExecution",
     "DiscoveredAsset",
+    "DNSRecord"
 ]

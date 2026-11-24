@@ -17,6 +17,8 @@ class AgentResult:
     findings: tuple[ScanFinding, ...] = ()
 
     asset_candidates: tuple[AssetCandidate, ...] = ()
+    
+    dns_records: tuple[DNSRecordCandidate, ...] = ()
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -37,3 +39,14 @@ class AgentResult:
             raise ValueError(
                 "Failed execution must contain an error message"
             )
+
+@dataclass(frozen=True)
+class DNSRecordCandidate:
+    """A DNS record associated with a persisted discovered asset."""
+
+    asset_id: str
+    record_name: str
+    record_type: str
+    value: str
+    ttl: int | None = None
+    priority: int | None = None

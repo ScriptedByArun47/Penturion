@@ -27,11 +27,22 @@ from app.models.finding import Finding
 from app.scanners.adapters.http_scanner import HTTPScanner
 from app.scanners.recon.crtsh_provider import CrtShSubdomainProvider
 
-from app.scanners.agent_context import AgentExecutionContext
+from app.scanners.agent_context import (
+    AgentExecutionContext,
+    DiscoveredAsset as AgentDiscoveredAsset,
+)
+
 from app.scanners.executor import AgentExecutionCancelled
 from app.scanners.recon.subdomain_discovery import SubdomainDiscoveryAgent
 from app.services.discovered_asset_service import persist_discovered_assets
 
+from app.models.discovered_asset import DiscoveredAsset as DiscoveredAssetModel
+from app.scanners.recon.dns_enumeration import DNSEnumerationAgent
+from app.scanners.recon.dns_provider import DNSRecordProvider
+from app.services.dns_record_service import (
+    persist_dns_records,
+    validate_dns_scan_access,
+)
 
 from app.models.authorization import AuthorizationRequest
 from app.scanners.scope import (
@@ -40,10 +51,14 @@ from app.scanners.scope import (
     normalize_hostname,
     validate_target_in_scope,
 )
+
+
 from app.services.authorization_scope import (
     AuthorizationScopeError,
     validate_authorization_scope,
 )
+
+
 
 
 ALLOWED_SCAN_TRANSITIONS = {
@@ -53,6 +68,10 @@ ALLOWED_SCAN_TRANSITIONS = {
     "failed": set(),
     "cancelled": set(),
 }
+
+def create_dns_record_provider():
+    """Create the production DNS record provider."""
+    return DNSRecordProvider()
 
 class ScanLifecycleError(Exception):
     """Raised when a scan lifecycle transition is invalid."""
@@ -755,6 +774,7 @@ def process_next_scan(
                     request_limiter=_NoopRequestLimiter(),
                 )
 
+                # A01: Passive subdomain discovery.
                 discovery_result = SubdomainDiscoveryAgent(
                     create_subdomain_discovery_provider()
                 ).execute(context)
@@ -767,8 +787,8 @@ def process_next_scan(
                         error=discovery_result.error,
                     )
                 else:
-                    # Persist discoveries with independent scope validation.
-                    persist_discovered_assets(
+                    # Persist discovered assets and their scope status.
+                    persisted_assets = persist_discovered_assets(
                         db=db,
                         scan_id=scan_id,
                         worker_id=worker_id,
@@ -779,19 +799,91 @@ def process_next_scan(
                     )
                     db.commit()
 
-                    if root_domain_approved:
-                        # Root is explicitly approved for active testing.
-                        result = HTTPScanner(
-                            cancel_event=keeper.cancel_event
-                        ).execute(scan_url)
-                    else:
-                        # Narrow scope: never actively scan the root.
-                        result = ScannerResult(
-                            scanner_name="A01",
-                            target=scan_url,
-                            success=True,
-                            findings=(),
+                    if keeper.cancel_event.is_set():
+                        raise AgentExecutionCancelled(
+                            "DNS enumeration was cancelled."
                         )
+
+                    # Revalidate authorization and worker lease before A02.
+                    root_domain = validate_dns_scan_access(
+                        db,
+                        scan_id,
+                        worker_id,
+                    )
+
+                    # Only pass persisted, in-scope subdomains to A02.
+                    agent_assets = tuple(
+                        AgentDiscoveredAsset(
+                            value=asset.value,
+                            asset_type=asset.asset_type,
+                            source_agent=asset.source_agent,
+                            discovered_at=asset.discovered_at,
+                            metadata=asset.metadata_json or {},
+                            asset_id=asset.id,
+                            scope_status=asset.scope_status,
+                        )
+                        for asset in persisted_assets
+                        if asset.asset_type == "subdomain"
+                        and asset.scope_status == "in_scope"
+                    )
+
+                    dns_context = AgentExecutionContext(
+                        scan_id=scan_id,
+                        target=root_domain,
+                        target_type="domain",
+                        authorized_value=root_domain,
+                        timeout_seconds=60,
+                        cancel_event=keeper.cancel_event,
+                        request_limiter=_NoopRequestLimiter(),
+                        discovered_assets=agent_assets,
+                    )
+
+                    # A02: DNS record enumeration.
+                    dns_result = DNSEnumerationAgent(
+                        create_dns_record_provider()
+                    ).execute(dns_context)
+
+                    if not dns_result.success:
+                        result = ScannerResult(
+                            scanner_name="A02",
+                            target=scan_url,
+                            success=False,
+                            error=dns_result.error,
+                        )
+                    else:
+                        if keeper.cancel_event.is_set():
+                            raise AgentExecutionCancelled(
+                                "DNS enumeration was cancelled."
+                            )
+
+                        # Revalidate access and persist DNS records.
+                        validate_dns_scan_access(
+                            db,
+                            scan_id,
+                            worker_id,
+                        )
+
+                        persist_dns_records(
+                            db=db,
+                            scan_id=scan_id,
+                            worker_id=worker_id,
+                            dns_records=dns_result.dns_records,
+                        )
+                        db.commit()
+
+                        if root_domain_approved:
+                            # Root is explicitly approved for active testing.
+                            result = HTTPScanner(
+                                cancel_event=keeper.cancel_event
+                            ).execute(scan_url)
+                        else:
+                            # Narrow scope: never actively scan the root.
+                            result = ScannerResult(
+                                scanner_name="A02",
+                                target=scan_url,
+                                success=True,
+                                findings=(),
+                            )
 
             else:
                 # Preserve existing URL-target scanning.

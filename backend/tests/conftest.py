@@ -145,3 +145,21 @@ def mock_subdomain_discovery_provider(monkeypatch):
         "create_subdomain_discovery_provider",
         MockSubdomainDiscoveryProvider,
     )
+class MockDNSRecordProvider:
+    def collect(self, *, hostname, timeout_seconds, cancel_event):
+        if cancel_event.is_set():
+            from app.scanners.executor import AgentExecutionCancelled
+            raise AgentExecutionCancelled("DNS enumeration cancelled")
+
+        return []
+
+
+@pytest.fixture(autouse=True)
+def mock_dns_record_provider(monkeypatch):
+    from app.services import scan_service
+
+    monkeypatch.setattr(
+        scan_service,
+        "create_dns_record_provider",
+        MockDNSRecordProvider,
+    )

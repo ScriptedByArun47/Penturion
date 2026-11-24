@@ -30,6 +30,10 @@ from app.services.scan_service import (
     fail_running_scan,
     update_scan_heartbeat,
 )
+from app.models.discovered_asset import DiscoveredAsset
+from app.models.dns_record import DNSRecord
+from app.scanners.recon.dns_provider import DNSRecordData
+
 
 def test_worker_executes_scanner_and_completes_scan(
     auth_client, target_id
@@ -1572,6 +1576,120 @@ def test_worker_fails_when_a01_discovery_fails(
         assert processed.completed_at is not None
 
         mock_execute.assert_not_called()
+
+    finally:
+        db_generator.close()
+        
+def test_worker_runs_a02_and_persists_dns_records(
+    auth_client, target_id, monkeypatch
+):
+    from app.services import scan_service
+    from app.scanners.agent_result import DNSRecordCandidate
+
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    queried_hosts = []
+
+    class FakeDNSProvider:
+        def collect(self, *, hostname, timeout_seconds, cancel_event):
+            queried_hosts.append(hostname)
+
+            return [
+                DNSRecordData(
+                    record_name=hostname,
+                    record_type="A",
+                    value="93.184.216.34",
+                    ttl=300,
+                )
+            ]
+
+    monkeypatch.setattr(
+        scan_service,
+        "create_dns_record_provider",
+        FakeDNSProvider,
+    )
+
+    mock_result = ScannerResult(
+        scanner_name="http",
+        target="https://scan-test.example.com/",
+        success=True,
+        findings=(),
+    )
+
+    try:
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute",
+            return_value=mock_result,
+        ):
+            processed = process_next_scan(db)
+
+        assert processed is not None
+        assert processed.id == scan_id
+        assert processed.status == "completed"
+
+        # Only the two in-scope discovered subdomains should be queried.
+        assert set(queried_hosts) == {
+            "api.scan-test.example.com",
+            "www.scan-test.example.com",
+        }
+
+        records = (
+            db.query(DNSRecord)
+            .join(DiscoveredAsset)
+            .filter(DiscoveredAsset.scan_id == scan_id)
+            .all()
+        )
+
+        assert len(records) == 2
+        assert all(record.record_type == "A" for record in records)
+        assert all(record.value == "93.184.216.34" for record in records)
+        assert all(record.ttl == 300 for record in records)
+
+    finally:
+        db_generator.close()
+
+def test_worker_fails_when_a02_dns_enumeration_fails(
+    auth_client, target_id, monkeypatch
+):
+    from app.services import scan_service
+
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    class FailingDNSProvider:
+        def collect(self, **kwargs):
+            raise RuntimeError("Simulated DNS enumeration failure")
+
+    monkeypatch.setattr(
+        scan_service,
+        "create_dns_record_provider",
+        FailingDNSProvider,
+    )
+
+    try:
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute"
+        ) as mock_execute:
+            processed = process_next_scan(db)
+
+        assert processed is not None
+        assert processed.id == scan_id
+        assert processed.status == "failed"
+        assert processed.completed_at is not None
+
+        mock_execute.assert_not_called()
+
+        records = (
+            db.query(DNSRecord)
+            .join(DiscoveredAsset)
+            .filter(DiscoveredAsset.scan_id == scan_id)
+            .all()
+        )
+
+        assert records == []
 
     finally:
         db_generator.close()

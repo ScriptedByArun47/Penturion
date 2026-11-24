@@ -34,6 +34,8 @@ class DiscoveredAsset:
     source_agent: str
     discovered_at: datetime
     metadata: dict[str, Any] = field(default_factory=dict)
+    asset_id: str | None = None
+    scope_status: str | None = None
 
 
 @dataclass(frozen=True)
