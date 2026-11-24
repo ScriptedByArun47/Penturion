@@ -6,6 +6,11 @@ from unittest.mock import patch
 import pytest
 from app.services.scan_service import ScanAuthorizationError
 
+import json
+
+from app.models.authorization import AuthorizationRequest
+from app.models.discovered_asset import DiscoveredAsset
+
 from app.models.finding import Finding
 from app.scanners.base import ScanFinding, ScannerResult
 
@@ -1436,3 +1441,137 @@ def test_worker_cancels_running_scan_without_persisting_findings(
     finally:
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
+
+def test_worker_runs_a01_and_scans_approved_root(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        mock_result = ScannerResult(
+            scanner_name="http",
+            target="https://scan-test.example.com/",
+            success=True,
+            findings=(),
+        )
+
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute",
+            return_value=mock_result,
+        ) as mock_execute:
+            processed = process_next_scan(db)
+
+        assert processed is not None
+        assert processed.id == scan_id
+        assert processed.status == "completed"
+
+        mock_execute.assert_called_once_with(
+            "https://scan-test.example.com/"
+        )
+
+        assets = (
+            db.query(DiscoveredAsset)
+            .filter_by(scan_id=scan_id)
+            .all()
+        )
+
+        asset_statuses = {
+            asset.value: asset.scope_status
+            for asset in assets
+        }
+
+        assert asset_statuses == {
+            "api.scan-test.example.com": "in_scope",
+            "www.scan-test.example.com": "in_scope",
+        }
+
+    finally:
+        db_generator.close()
+        
+def test_worker_skips_root_http_scan_for_narrow_scope(
+    auth_client, target_id
+):
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    try:
+        authorization = (
+            db.query(AuthorizationRequest)
+            .filter_by(target_id=target_id)
+            .first()
+        )
+        assert authorization is not None
+
+        authorization.requested_scope = json.dumps([
+            "api.scan-test.example.com"
+        ])
+        db.commit()
+
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute"
+        ) as mock_execute:
+            processed = process_next_scan(db)
+
+        assert processed is not None
+        assert processed.id == scan_id
+        assert processed.status == "completed"
+
+        mock_execute.assert_not_called()
+
+        assets = (
+            db.query(DiscoveredAsset)
+            .filter_by(scan_id=scan_id)
+            .all()
+        )
+
+        asset_statuses = {
+            asset.value: asset.scope_status
+            for asset in assets
+        }
+
+        assert asset_statuses == {
+            "api.scan-test.example.com": "in_scope",
+            "www.scan-test.example.com": "out_of_scope",
+        }
+
+    finally:
+        db_generator.close()
+
+
+def test_worker_fails_when_a01_discovery_fails(
+    auth_client, target_id, monkeypatch
+):
+    from app.services import scan_service
+
+    scan_id = create_queued_scan(auth_client, target_id)
+
+    db_generator, db = get_test_db(auth_client)
+
+    class FailingProvider:
+        def discover(self, **kwargs):
+            raise RuntimeError("Simulated CT lookup failure")
+
+    monkeypatch.setattr(
+        scan_service,
+        "create_subdomain_discovery_provider",
+        FailingProvider,
+    )
+
+    try:
+        with patch(
+            "app.services.scan_service.HTTPScanner.execute"
+        ) as mock_execute:
+            processed = process_next_scan(db)
+
+        assert processed is not None
+        assert processed.id == scan_id
+        assert processed.status == "failed"
+        assert processed.completed_at is not None
+
+        mock_execute.assert_not_called()
+
+    finally:
+        db_generator.close()
